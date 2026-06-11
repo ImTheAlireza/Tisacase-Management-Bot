@@ -1,0 +1,223 @@
+import pymysql
+import logging
+from config.database import get_db_connection
+from utils.helpers import get_tehran_time, to_utc_naive
+
+
+class ProductLine:
+    """Product Line model for managing product types"""
+
+    def __init__(self, id, code_prefix, name_en, name_fa, icon='📦',
+                 code_format='{prefix}{counter:03d}', counter_start=1,
+                 counter_end=999, has_mockup=True, has_print_file=True,
+                 is_active=True, display_order=0, created_at=None,
+                 updated_at=None, metadata=None,
+                 group_products=None, group_print=None):
+        self.id = id
+        self.code_prefix = code_prefix
+        self.name_en = name_en
+        self.name_fa = name_fa
+        self.icon = icon
+        self.code_format = code_format
+        self.counter_start = counter_start
+        self.counter_end = counter_end
+        self.has_mockup = has_mockup
+        self.has_print_file = has_print_file
+        self.is_active = is_active
+        self.display_order = display_order
+        self.created_at = created_at
+        self.updated_at = updated_at
+        self.metadata = metadata
+        self.group_products = group_products
+        self.group_print = group_print
+
+    def is_fully_configured(self):
+        """Return True if both groups are set"""
+        return self.group_products is not None and self.group_print is not None
+
+    def missing_groups(self):
+        """Return list of missing group names"""
+        missing = []
+        if self.group_products is None:
+            missing.append('group_products (گروه محصولات)')
+        if self.group_print is None:
+            missing.append('group_print (گروه چاپ)')
+        return missing
+
+    @staticmethod
+    def get_all_active():
+        """Get all active product lines"""
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            cursor.execute("""
+                SELECT * FROM product_lines
+                WHERE is_active = TRUE
+                ORDER BY display_order, name_fa
+            """)
+            return [ProductLine(**row) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def get_all():
+        """Get all product lines including inactive"""
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            cursor.execute("""
+                SELECT * FROM product_lines
+                ORDER BY display_order, name_fa
+            """)
+            return [ProductLine(**row) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def get_by_prefix(code_prefix):
+        """Get product line by code prefix"""
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            cursor.execute("""
+                SELECT * FROM product_lines
+                WHERE code_prefix = %s AND is_active = TRUE
+            """, (code_prefix,))
+            row = cursor.fetchone()
+            return ProductLine(**row) if row else None
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def get_by_id(product_line_id):
+        """Get product line by ID"""
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            cursor.execute("""
+                SELECT * FROM product_lines WHERE id = %s
+            """, (product_line_id,))
+            row = cursor.fetchone()
+            return ProductLine(**row) if row else None
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def create(code_prefix, name_en, name_fa, icon='📦',
+               code_format=None, counter_start=1, counter_end=999,
+               display_order=999):
+        """Create new product line"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            if not code_format:
+                code_format = f'{code_prefix}{{counter:03d}}'
+
+            cursor.execute("""
+                INSERT INTO product_lines
+                (code_prefix, name_en, name_fa, icon, code_format,
+                 counter_start, counter_end, display_order)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (code_prefix, name_en, name_fa, icon, code_format,
+                  counter_start, counter_end, display_order))
+
+            conn.commit()
+            product_line_id = cursor.lastrowid
+            logging.info(f"✅ Product line created: {code_prefix} - {name_fa}")
+            return ProductLine.get_by_id(product_line_id)
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to create product line: {e}")
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update(self, **kwargs):
+        """Update product line fields"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            allowed_fields = ['name_fa', 'icon', 'code_format',
+                              'counter_start', 'counter_end',
+                              'is_active', 'display_order',
+                              'group_products', 'group_print']
+
+            updates = []
+            values = []
+
+            for field, value in kwargs.items():
+                if field in allowed_fields:
+                    updates.append(f"{field} = %s")
+                    values.append(value)
+                    setattr(self, field, value)
+
+            if not updates:
+                return
+
+            values.append(self.id)
+            cursor.execute(f"""
+                UPDATE product_lines
+                SET {', '.join(updates)}
+                WHERE id = %s
+            """, values)
+
+            conn.commit()
+            logging.info(f"✅ Product line {self.code_prefix} updated")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to update product line: {e}")
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
+    def set_group(self, group_type, chat_id):
+        """
+        Set group_products or group_print for this product line.
+        group_type: 'products' or 'print'
+        chat_id: integer chat ID (negative for groups)
+        """
+        if group_type not in ('products', 'print'):
+            raise ValueError("group_type must be 'products' or 'print'")
+        field = f'group_{group_type}'
+        self.update(**{field: chat_id})
+        logging.info(f"✅ {self.code_prefix} {field} set to {chat_id}")
+
+    def deactivate(self):
+        self.update(is_active=False)
+
+    def activate(self):
+        self.update(is_active=True)
+
+    def get_stats(self):
+        """Get statistics for this product line"""
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            cursor.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
+                    SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected
+                FROM designs
+                WHERE product_line_id = %s
+            """, (self.id,))
+            stats = cursor.fetchone()
+
+            cursor.execute("""
+                SELECT COUNT(*) as locked_count
+                FROM designs_locked_codes
+                WHERE product_line_id = %s AND is_manual = TRUE
+            """, (self.id,))
+            stats['locked'] = cursor.fetchone()['locked_count']
+
+            return stats
+        finally:
+            cursor.close()
+            conn.close()
