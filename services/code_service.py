@@ -4,6 +4,7 @@ from config.database import get_db_connection
 from models.product_line import ProductLine
 from models.design import Design
 from utils.helpers import get_tehran_time, to_utc_naive
+from utils.enums import DesignStatus
 
 class CodeService:
     """Service for generating and managing design codes"""
@@ -11,7 +12,7 @@ class CodeService:
     @staticmethod
     def generate_code(product_line_prefix, editor_user_id, editor_name):
         """
-        Generate next available code for a product line
+        Generate next available code for a product line with proper locking
         
         Args:
             product_line_prefix: Code prefix (TS, STI, TB, TT)
@@ -33,16 +34,28 @@ class CodeService:
         cursor = conn.cursor()
         
         try:
-            # Get all used codes for this product line
+            # FIX: Start transaction with proper isolation
+            conn.begin()
+            
+            # FIX: Lock the relevant rows to prevent concurrent code generation
+            # Get all used codes for this product line with FOR UPDATE lock
             cursor.execute("""
                 SELECT code FROM designs 
                 WHERE product_line_id = %s
-                UNION
+                FOR UPDATE
+            """, (product_line.id,))
+            
+            used_codes_from_designs = {row[0] for row in cursor.fetchall()}
+            
+            cursor.execute("""
                 SELECT code FROM designs_locked_codes 
                 WHERE product_line_id = %s
-            """, (product_line.id, product_line.id))
+                FOR UPDATE
+            """, (product_line.id,))
             
-            used_codes = {row[0] for row in cursor.fetchall()}
+            used_codes_from_locked = {row[0] for row in cursor.fetchall()}
+            
+            used_codes = used_codes_from_designs | used_codes_from_locked
             
             # Find next available code
             prefix = product_line.code_prefix
@@ -54,24 +67,46 @@ class CodeService:
                 
                 if code not in used_codes:
                     # Create design with this code
+                    now_utc = to_utc_naive(get_tehran_time())
+                    
+                    # FIX: Insert directly in the same transaction
+                    cursor.execute("""
+                        INSERT INTO designs
+                        (code, product_line_id, status, editor_user_id, editor_name,
+                         mockup_file_ids, print_file_ids, created_at)
+                        VALUES (%s, %s, 'pending', %s, %s, '[]', '[]', %s)
+                    """, (code, product_line.id, editor_user_id, editor_name, now_utc))
+                    
+                    design_id = cursor.lastrowid
+                    
+                    # Commit the transaction
+                    conn.commit()
+                    
+                    logging.info(f"✅ Generated code {code} for {editor_name}")
+                    
+                    # Create design object to return
                     design = Design(
-                        id=None,
+                        id=design_id,
                         code=code,
                         product_line_id=product_line.id,
-                        status='pending',
+                        status=DesignStatus.PENDING,
                         editor_user_id=editor_user_id,
                         editor_name=editor_name,
                         mockup_file_ids=[],
-                        print_file_ids=[]
+                        print_file_ids=[],
+                        created_at=get_tehran_time()
                     )
-                    design.save()
                     
-                    logging.info(f"✅ Generated code {code} for {editor_name}")
-
                     return code, design
             
+            # If we get here, no codes available
+            conn.rollback()
             raise Exception(f"No available codes for {product_line_prefix} ({start}-{end})")
             
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Code generation failed for {product_line_prefix}: {e}")
+            raise
         finally:
             cursor.close()
             conn.close()
@@ -106,18 +141,33 @@ class CodeService:
             locked_by: User ID who is locking
             notes: Optional notes
         """
-        product_line = ProductLine.get_by_prefix(product_line_prefix)
+        # FIX: Allow locking codes even for inactive product lines
+        product_line = ProductLine.get_by_prefix(product_line_prefix, active_only=False)
         if not product_line:
             raise ValueError(f"Invalid product line: {product_line_prefix}")
-        
-        # Check if code is already used
-        if not CodeService.is_code_available(code):
-            raise ValueError(f"Code {code} is already in use")
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
         try:
+            # FIX: Use transaction for atomicity
+            conn.begin()
+            
+            # Check if code is already used
+            cursor.execute("""
+                SELECT COUNT(*) FROM designs WHERE code = %s
+            """, (code,))
+            designs_count = cursor.fetchone()[0]
+            
+            cursor.execute("""
+                SELECT COUNT(*) FROM designs_locked_codes WHERE code = %s
+            """, (code,))
+            locked_count = cursor.fetchone()[0]
+            
+            if designs_count > 0 or locked_count > 0:
+                conn.rollback()
+                raise ValueError(f"Code {code} is already in use")
+            
             now_utc = to_utc_naive(get_tehran_time())
             
             cursor.execute("""
@@ -226,17 +276,21 @@ class CodeService:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            # FIX: Use JSON functions for proper comparison
             cursor.execute("""
                 DELETE FROM designs
                 WHERE status = 'pending'
-                  AND mockup_file_ids = '[]'
-                  AND print_file_ids = '[]'
+                  AND JSON_LENGTH(mockup_file_ids) = 0
+                  AND JSON_LENGTH(print_file_ids) = 0
                   AND created_at < NOW() - INTERVAL 24 HOUR
             """)
             deleted = cursor.rowcount
             conn.commit()
             if deleted:
                 logging.info(f"🧹 Cleaned up {deleted} orphaned pending designs")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Cleanup orphaned designs failed: {e}")
         finally:
             cursor.close()
             conn.close()

@@ -2,6 +2,7 @@ import pymysql
 import logging
 from config.database import get_db_connection
 from utils.helpers import get_tehran_time, to_utc_naive
+from utils.enums import DesignStatus
 
 
 class DesignGroupMessage:

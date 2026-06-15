@@ -2,6 +2,10 @@ import logging
 import asyncio
 import html
 from datetime import time
+from utils.enums import DesignStatus
+import traceback
+
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -57,6 +61,47 @@ from handlers.design_management import (
 # Models
 from models.product_line import ProductLine
 from models.user import User
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global handler for uncaught exceptions in any handler.
+    Logs to console, sends to LOG_GROUP_ID, and notifies user if possible.
+    """
+    # Log the full traceback
+    logging.error("Uncaught exception:", exc_info=context.error)
+    tb_str = ''.join(traceback.format_exception(
+        type(context.error), context.error, context.error.__traceback__
+    ))
+
+    # Build a safe message for Telegram (max 4096 chars)
+    safe_tb = html.escape(tb_str[-3000:])
+    error_msg = (
+        f"⚠️ <b>Uncaught Exception</b>\n\n"
+        f"<pre>{safe_tb}</pre>"
+    )
+
+    # Try to send to log group
+    try:
+        await context.bot.send_message(
+            chat_id=LOG_GROUP_ID,
+            text=error_msg,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Failed to send error to log group: {e}")
+
+    # Try to notify the user something went wrong
+    if isinstance(update, Update):
+        user_msg = "❌ خطای داخلی رخ داد. تیم فنی در جریان قرار گرفت."
+        try:
+            if update.callback_query:
+                await update.callback_query.answer(user_msg, show_alert=True)
+            elif update.message:
+                await update.message.reply_text(user_msg)
+        except Exception:
+            pass
+
+
 
 # Setup Logging
 logging.basicConfig(
@@ -115,9 +160,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = (
                     f"{pl.icon} آمار {pl.name_fa}\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"⏳ در انتظار: {stats['pending']}\n"
-                    f"✅ تایید شده: {stats['approved']}\n"
-                    f"❌ رد شده: {stats['rejected']}\n"
+                    f"⏳ در انتظار: {stats[DesignStatus.PENDING]}\n"
+                    f"✅ تایید شده: {stats[DesignStatus.APPROVED]}\n"
+                    f"❌ رد شده: {stats[DesignStatus.REJECTED]}\n"
                     f"🔒 قفل شده: {stats['locked']}"
                 )
                 await update.message.reply_text(msg)
@@ -200,10 +245,16 @@ class TelegramLogHandler(logging.Handler):
         self.chat_id = chat_id
         self.message_queue = []
         self.is_sending = False
+        self._recursion_guard = False  # FIX: Add recursion protection
 
     def emit(self, record):
+        # FIX: Prevent recursion
+        if self._recursion_guard:
+            return
+            
         if record.levelno >= logging.INFO:
             try:
+                self._recursion_guard = True
                 log_entry = self.format(record)
                 self.message_queue.append(log_entry)
                 if not self.is_sending:
@@ -212,11 +263,17 @@ class TelegramLogHandler(logging.Handler):
                         loop.create_task(self._process_queue())
             except Exception:
                 pass
+            finally:
+                self._recursion_guard = False
 
     async def _process_queue(self):
         if self.is_sending:
             return
         self.is_sending = True
+        
+        # FIX: Add recursion guard during sending too
+        self._recursion_guard = True
+        
         try:
             while self.message_queue:
                 msg = self.message_queue.pop(0)
@@ -229,9 +286,11 @@ class TelegramLogHandler(logging.Handler):
                     )
                     await asyncio.sleep(0.3)
                 except Exception:
+                    # FIX: Don't log the error (would cause recursion)
                     pass
         finally:
             self.is_sending = False
+            self._recursion_guard = False
 
 if __name__ == "__main__":
     logging.info("🚀 Starting Tisa Print Bot...")
@@ -240,6 +299,7 @@ if __name__ == "__main__":
     run_db_migrations()
 
     application = Application.builder().token(BOT_TOKEN).build()
+    application.add_error_handler(global_error_handler)
 
     telegram_handler = TelegramLogHandler(application.bot, LOG_GROUP_ID)
     telegram_handler.setLevel(logging.INFO)
@@ -313,7 +373,7 @@ if __name__ == "__main__":
     ))
     application.add_handler(CallbackQueryHandler(
         confirm_delete_callback,
-        pattern=r"^(confirm_delete_|cancel_delete)"
+        pattern=r"^(confirm_delete_.+|cancel_delete)$"
     ))
     application.add_handler(CallbackQueryHandler(
         pending_view_callback,

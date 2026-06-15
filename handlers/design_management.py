@@ -1,27 +1,47 @@
 import logging
 import asyncio
-from io import BytesIO
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+import time
+from typing import Optional
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import ContextTypes
+
 from config.settings import SUDO_USER_ID, NAZI_CHAT_ID
 from models.design import Design
 from models.product_line import ProductLine
 from models.design_group_message import DesignGroupMessage
+from models.user import User
 from utils.helpers import safe_edit_message, delete_messages, format_datetime_persian
+from utils.enums import DesignStatus
+from utils.callback_lock import deduplicate_callback
 
 
-def is_privileged(user_id):
-    """Sudo and Nazi only"""
-    return user_id in (SUDO_USER_ID, NAZI_CHAT_ID)
+# ===========================================================================
+# HELPER: Centralized privilege check
+# ===========================================================================
+
+def is_privileged(user_id: int) -> bool:
+    """
+    Check if user is privileged (Sudo or Nazi).
+    Uses centralized User.is_privileged_user() method.
+    """
+    return User.is_privileged_user(user_id)
 
 
-# ---------------------------------------------------------------------------
-# Design info — "اطلاعات طرح"
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# DESIGN INFO COMMAND — "اطلاعات طرح"
+# ===========================================================================
 
-async def design_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point: ask for a code"""
-    user_id = update.effective_user.id
+async def design_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Entry point for /designinfo command.
+    Asks user to input a design code.
+    """
+    user_id: int = update.effective_user.id
     if not is_privileged(user_id):
         await update.message.reply_text("🚫 دسترسی غیرمجاز.")
         return
@@ -34,9 +54,16 @@ async def design_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point: ask for a code to delete"""
-    user_id = update.effective_user.id
+# ===========================================================================
+# DELETE DESIGN COMMAND — "حذف طرح"
+# ===========================================================================
+
+async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Entry point for /deletedesign command.
+    Asks user to input a code to delete.
+    """
+    user_id: int = update.effective_user.id
     if not is_privileged(user_id):
         await update.message.reply_text("🚫 دسترسی غیرمجاز.")
         return
@@ -50,16 +77,20 @@ async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def handle_design_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===========================================================================
+# HANDLE TEXT INPUT FOR DESIGN CODE
+# ===========================================================================
+
+async def handle_design_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Handles text input when awaiting a design code.
     Returns True if it consumed the message, False otherwise.
     """
-    mode = context.user_data.get('awaiting_design_code')
+    mode: Optional[str] = context.user_data.get('awaiting_design_code')
     if mode not in ('info', 'delete'):
         return False
 
-    code = update.message.text.strip().upper()
+    code: str = update.message.text.strip().upper()
     context.user_data.pop('awaiting_design_code', None)
 
     if mode == 'info':
@@ -70,73 +101,97 @@ async def handle_design_code_input(update: Update, context: ContextTypes.DEFAULT
     return True
 
 
-async def _send_design_info(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
-    """Fetch and display full design info + files"""
-    design = Design.get_by_code(code)
+# ===========================================================================
+# SEND FULL DESIGN INFO
+# ===========================================================================
+
+async def _send_design_info(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    code: str
+) -> None:
+    """
+    Fetch and display full design info + files.
+    Improved with:
+    - Enum status handling
+    - Better file sending with fallback
+    - Proper error handling
+    """
+    design: Optional[Design] = Design.get_by_code(code)
     if not design:
         await update.message.reply_text(f"❌ طرح با کد '{code}' یافت نشد.")
         return
 
-    product_line = ProductLine.get_by_id(design.product_line_id)
-    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
+    product_line: Optional[ProductLine] = ProductLine.get_by_id(design.product_line_id)
+    pl_name: str = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
 
+    # Status mapping with Enum
     status_map = {
-        'pending': '⏳ در انتظار بررسی',
-        'approved': '✅ تایید شده',
-        'rejected': '❌ رد شده'
+        DesignStatus.PENDING:  "⏳ در انتظار بررسی",
+        DesignStatus.APPROVED: "✅ تایید شده",
+        DesignStatus.REJECTED: "❌ رد شده",
+        DesignStatus.DELETED:  "🗑 حذف شده",
     }
-    status_text = status_map.get(design.status, design.status)
+    status_text: str = status_map.get(design.status, design.status.value)
 
     # Build info text
     lines = [
         f"📋 اطلاعات طرح: {code}",
-        f"━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━",
         f"📦 خط تولید:  {pl_name}",
         f"👤 طراح:       {design.editor_name or 'نامشخص'}",
         f"📅 تاریخ ثبت: {format_datetime_persian(design.created_at)}",
         f"🔖 وضعیت:    {status_text}",
     ]
 
-    if design.status in ('approved', 'rejected') and design.reviewer_name:
-        lines.append(f"✅ ناظر:      {design.reviewer_name}")
-        lines.append(f"📅 تاریخ بررسی: {format_datetime_persian(design.reviewed_at)}")
+    if design.status in (DesignStatus.APPROVED, DesignStatus.REJECTED, DesignStatus.DELETED):
+        if design.reviewer_name:
+            lines.append(f"✅ ناظر:      {design.reviewer_name}")
+            lines.append(f"📅 تاریخ بررسی: {format_datetime_persian(design.reviewed_at)}")
 
     lines.append(f"\n🖼 موکاپ: {len(design.mockup_file_ids)} فایل")
     lines.append(f"🖨 فایل چاپی: {len(design.print_file_ids)} فایل")
 
-    info_text = '\n'.join(lines)
+    info_text: str = '\n'.join(lines)
 
     # Send info message
     await update.message.reply_text(info_text)
+
+    # Helper: safe file sending with fallback
+    async def send_file_safe(chat_id: int, file_id: str, caption: str) -> None:
+        """Try to send as photo first, fallback to document"""
+        try:
+            # Try as photo
+            await context.bot.send_photo(chat_id, photo=file_id, caption=caption)
+        except Exception:
+            # Fallback to document
+            try:
+                await context.bot.send_document(chat_id, document=file_id, caption=caption)
+            except Exception as e:
+                logging.error(f"Failed to send file {file_id}: {e}")
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ خطا در ارسال فایل: {caption}\nFile ID: {file_id[:20]}..."
+                )
 
     # Send mockup files
     if design.mockup_file_ids:
         await update.message.reply_text("🖼 موکاپ‌ها:")
         for i, fid in enumerate(design.mockup_file_ids):
-            try:
-                cap = f"موکاپ {i+1}/{len(design.mockup_file_ids)} — {code}"
-                if fid.startswith(('AgAC', 'AQA')):
-                    await context.bot.send_photo(
-                        update.effective_chat.id, photo=fid, caption=cap
-                    )
-                else:
-                    await context.bot.send_document(
-                        update.effective_chat.id, document=fid, caption=cap
-                    )
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logging.error(f"Failed to send mockup {i} for {code}: {e}")
-                await update.message.reply_text(f"⚠️ موکاپ {i+1} قابل ارسال نیست.")
+            cap: str = f"موکاپ {i+1}/{len(design.mockup_file_ids)} — {code}"
+            await send_file_safe(update.effective_chat.id, fid, cap)
+            await asyncio.sleep(0.3)
     else:
         await update.message.reply_text("⚠️ موکاپی برای این طرح ذخیره نشده.")
 
     # Send print files
     if design.print_file_ids:
-        unique_prints = list(dict.fromkeys(design.print_file_ids))
+        unique_prints: list = list(dict.fromkeys(design.print_file_ids))
         await update.message.reply_text("🖨 فایل‌های چاپی:")
         for i, fid in enumerate(unique_prints):
+            cap: str = f"فایل چاپی {i+1}/{len(unique_prints)} — {code}"
+            # Print files should always be documents
             try:
-                cap = f"فایل چاپی {i+1}/{len(unique_prints)} — {code}"
                 await context.bot.send_document(
                     update.effective_chat.id, document=fid, caption=cap
                 )
@@ -148,30 +203,45 @@ async def _send_design_info(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("⚠️ فایل چاپی برای این طرح ذخیره نشده.")
 
 
-async def _send_delete_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
-    """Show mockup + confirm/cancel buttons before deleting"""
-    design = Design.get_by_code(code)
+# ===========================================================================
+# SEND DELETE CONFIRMATION
+# ===========================================================================
+
+async def _send_delete_confirmation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    code: str
+) -> None:
+    """
+    Show mockup + confirm/cancel buttons before deleting.
+    Only approved designs can be deleted.
+    """
+    design: Optional[Design] = Design.get_by_code(code)
     if not design:
         await update.message.reply_text(f"❌ طرح با کد '{code}' یافت نشد.")
         return
 
-    if design.status != 'approved':
-        status_map = {'pending': 'در انتظار', 'rejected': 'رد شده'}
-        st = status_map.get(design.status, design.status)
+    if design.status != DesignStatus.APPROVED:
+        status_map = {
+            DesignStatus.PENDING:  'در انتظار',
+            DesignStatus.REJECTED: 'رد شده',
+            DesignStatus.DELETED:  'حذف شده'
+        }
+        st: str = status_map.get(design.status, design.status.value)
         await update.message.reply_text(
             f"❌ فقط طرح‌های تایید شده قابل حذف هستند.\n"
             f"وضعیت {code}: {st}"
         )
         return
 
-    product_line = ProductLine.get_by_id(design.product_line_id)
-    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
+    product_line: Optional[ProductLine] = ProductLine.get_by_id(design.product_line_id)
+    pl_name: str = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
 
     # Check if group messages are tracked
-    group_msgs = DesignGroupMessage.get_by_code(code)
-    group_msg_count = len(group_msgs)
+    group_msgs: list = DesignGroupMessage.get_by_code(code)
+    group_msg_count: int = len(group_msgs)
 
-    confirm_text = (
+    confirm_text: str = (
         f"⚠️ تایید حذف طرح\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🔖 کد: {code}\n"
@@ -190,61 +260,87 @@ async def _send_delete_confirmation(update: Update, context: ContextTypes.DEFAUL
 
     # Send first mockup as preview if available
     if design.mockup_file_ids:
-        fid = design.mockup_file_ids[0]
+        fid: str = design.mockup_file_ids[0]
         try:
-            if fid.startswith(('AgAC', 'AQA')):
-                await context.bot.send_photo(
-                    update.effective_chat.id,
-                    photo=fid,
-                    caption=confirm_text,
-                    reply_markup=markup
-                )
-            else:
+            # Try sending as photo with caption
+            await context.bot.send_photo(
+                update.effective_chat.id,
+                photo=fid,
+                caption=confirm_text,
+                reply_markup=markup
+            )
+            return
+        except Exception:
+            # Fallback to document
+            try:
                 await context.bot.send_document(
                     update.effective_chat.id,
                     document=fid,
                     caption=confirm_text,
                     reply_markup=markup
                 )
-            return
-        except Exception as e:
-            logging.error(f"Failed to send mockup preview for delete: {e}")
+                return
+            except Exception as e:
+                logging.error(f"Failed to send mockup preview for delete: {e}")
 
-    # Fallback: no mockup, just text
+    # Fallback: no mockup or send failed, just text
     await update.message.reply_text(confirm_text, reply_markup=markup)
 
 
-async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle confirm/cancel delete buttons"""
+# ===========================================================================
+# CONFIRM DELETE CALLBACK (with deduplication)
+# ===========================================================================
+
+def _delete_key(update, context) -> str:
+    """Lock key for delete confirmation — prevents double-tap"""
+    data: str = update.callback_query.data
+    if data == "cancel_delete":
+        return "cancel_delete"
+    code: str = data.split('_', 2)[2]
+    return f"delete_{code}"
+
+
+@deduplicate_callback(_delete_key)
+async def confirm_delete_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Handle confirm/cancel delete buttons.
+    Protected with deduplication to prevent race conditions.
+    """
     query = update.callback_query
     await query.answer()
 
-    if not is_privileged(query.from_user.id):
+    # Fresh privilege check
+    user: Optional[User] = User.get_by_id(query.from_user.id)
+    if not user or not is_privileged(user.user_id):
         await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+        await safe_edit_message(query, "🚫 شما مجاز به حذف طرح نیستید.")
         return
 
     if query.data == "cancel_delete":
         await safe_edit_message(query, "👌 عملیات حذف لغو شد.")
         return
 
-    # confirm_delete_{code}
-    code = query.data.split('_', 2)[2]
-    design = Design.get_by_code(code)
+    # Extract code from callback data: confirm_delete_{code}
+    code: str = query.data.split('_', 2)[2]
+    design: Optional[Design] = Design.get_by_code(code)
 
     if not design:
         await safe_edit_message(query, "❌ طرح یافت نشد.")
         return
 
-    if design.status != 'approved':
+    if design.status != DesignStatus.APPROVED:
         await safe_edit_message(query, "❌ فقط طرح‌های تایید شده قابل حذف هستند.")
         return
 
     await safe_edit_message(query, f"⏳ در حال حذف طرح {code} از گروه‌ها...")
 
     # Delete messages from groups
-    group_msgs = DesignGroupMessage.get_by_code(code)
-    deleted_from_groups = 0
-    failed_deletions = 0
+    group_msgs: list = DesignGroupMessage.get_by_code(code)
+    deleted_from_groups: int = 0
+    failed_deletions: int = 0
 
     for record in group_msgs:
         try:
@@ -266,13 +362,11 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
     _free_locked_code(code)
 
     # Rename the design record to free the original code
-    # (same _REJ_ pattern used for rejected — append _DEL_ + timestamp)
-    import time as time_module
     _rename_design_as_deleted(design, code)
 
     result_lines = [
         f"✅ طرح {code} با موفقیت حذف شد.",
-        f"━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━",
         f"🗑 پیام‌های حذف شده از گروه: {deleted_from_groups}",
     ]
     if failed_deletions:
@@ -285,8 +379,8 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-def _free_locked_code(code: str):
-    """Remove code from designs_locked_codes"""
+def _free_locked_code(code: str) -> None:
+    """Remove code from designs_locked_codes table"""
     from config.database import get_db_connection
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -304,17 +398,19 @@ def _free_locked_code(code: str):
         conn.close()
 
 
-def _rename_design_as_deleted(design, original_code: str):
-    """Rename the design code to _DEL_{timestamp} to free the original code slot"""
-    import time as time_module
+def _rename_design_as_deleted(design: Design, original_code: str) -> None:
+    """
+    Rename the design code to {CODE}_DEL_{timestamp} to free the original code slot.
+    Same pattern as rejection (_REJ_).
+    """
     from config.database import get_db_connection
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        del_code = f"{original_code}_DEL_{int(time_module.time())}"
+        del_code: str = f"{original_code}_DEL_{int(time.time())}"
         cursor.execute(
-            "UPDATE designs SET code = %s, status = 'deleted' WHERE id = %s",
-            (del_code, design.id)
+            "UPDATE designs SET code = %s, status = %s WHERE id = %s",
+            (del_code, DesignStatus.DELETED.value, design.id)
         )
         conn.commit()
         logging.info(f"🗑 Design {original_code} renamed to {del_code}")
@@ -326,38 +422,41 @@ def _rename_design_as_deleted(design, original_code: str):
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Pending designs — with inline code buttons
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PENDING DESIGNS LIST — with inline code buttons
+# ===========================================================================
 
-async def pending_designs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pending_designs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Show pending designs as inline code buttons.
     Accessible to privileged users AND all reviewers.
     """
-    from models.user import User
-    user_id = update.effective_user.id
-    user = User.get_by_id(user_id)
+    user_id: int = update.effective_user.id
+    user: Optional[User] = User.get_by_id(user_id)
 
     if not user or not user.is_active:
         await update.message.reply_text("🚫 دسترسی غیرمجاز.")
         return
 
     # Sudo, Nazi, or any reviewer
-    is_reviewer = user.role == 'reviewer' or user.is_sudo or user_id == NAZI_CHAT_ID
+    is_reviewer: bool = (
+        user.role == 'reviewer'
+        or user.is_sudo
+        or User.is_privileged_user(user_id)
+    )
     if not is_reviewer:
         await update.message.reply_text("🚫 دسترسی غیرمجاز.")
         return
 
-    pending = Design.get_all_pending()
+    pending: list[Design] = Design.get_all_pending()
     if not pending:
         await update.message.reply_text("✨ هیچ طرحی در انتظار بررسی نیست.")
         return
 
     # Group by product line
-    by_line = {}
+    by_line: dict = {}
     for d in pending:
-        key = f"{d.product_icon} {d.product_name}"
+        key: str = f"{d.product_icon} {d.product_name}"
         by_line.setdefault(key, []).append(d)
 
     lines = [f"📋 طرح‌های در انتظار ({len(pending)} طرح)\n━━━━━━━━━━━━━━━━━━"]
@@ -385,39 +484,58 @@ async def pending_designs_command(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===========================================================================
+# PENDING VIEW CALLBACK — send files when code button tapped
+# ===========================================================================
+
+async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Send mockup + print files when a code button is tapped in pending list.
+    Improved with:
+    - File count warning for large designs
+    - Better file sending with fallback
+    - Completion message
     """
-    from models.user import User
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
-    user = User.get_by_id(user_id)
+    user_id: int = query.from_user.id
+    user: Optional[User] = User.get_by_id(user_id)
 
     if not user or not user.is_active:
         await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
         return
 
-    is_reviewer = user.role == 'reviewer' or user.is_sudo or user_id == NAZI_CHAT_ID
+    is_reviewer: bool = (
+        user.role == 'reviewer'
+        or user.is_sudo
+        or User.is_privileged_user(user_id)
+    )
     if not is_reviewer:
         await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
         return
 
-    code = query.data.split('_', 2)[2]
-    design = Design.get_by_code(code)
+    code: str = query.data.split('_', 2)[2]
+    design: Optional[Design] = Design.get_by_code(code)
 
     if not design:
         await query.answer("❌ این طرح یافت نشد یا حذف شده.", show_alert=True)
         return
 
-    if design.status != 'pending':
+    if design.status != DesignStatus.PENDING:
         await query.answer("⚠️ این طرح دیگر در انتظار نیست.", show_alert=True)
         return
 
-    product_line = ProductLine.get_by_id(design.product_line_id)
-    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
+    product_line: Optional[ProductLine] = ProductLine.get_by_id(design.product_line_id)
+    pl_name: str = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
+
+    # Warn if too many files
+    total_files: int = len(design.mockup_file_ids) + len(set(design.print_file_ids))
+    if total_files > 10:
+        await query.answer(
+            f"⚠️ این طرح {total_files} فایل دارد. ارسال ممکن است کمی طول بکشد...",
+            show_alert=True
+        )
 
     # Send info header
     await context.bot.send_message(
@@ -426,28 +544,42 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"📋 {pl_name} | کد: {code}\n"
             f"👤 طراح: {design.editor_name or 'نامشخص'}\n"
             f"📅 ثبت: {format_datetime_persian(design.created_at)}\n"
-            f"🖼 موکاپ: {len(design.mockup_file_ids)} | 🖨 چاپی: {len(design.print_file_ids)}"
+            f"🖼 موکاپ: {len(design.mockup_file_ids)} | 🖨 چاپی: {len(design.print_file_ids)}\n\n"
+            f"⏳ در حال ارسال فایل‌ها..."
         )
     )
 
-    # Send mockups
-    for i, fid in enumerate(design.mockup_file_ids):
+    # Helper: safe file sending with fallback
+    async def send_file_safe(chat_id: int, file_id: str, caption: str) -> None:
+        """Try to send as photo first, fallback to document"""
         try:
-            cap = f"🖼 موکاپ {i+1} — {code}"
-            if fid.startswith(('AgAC', 'AQA')):
-                await context.bot.send_photo(user_id, photo=fid, caption=cap)
-            else:
-                await context.bot.send_document(user_id, document=fid, caption=cap)
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            logging.error(f"Failed to send mockup {i} to {user_id}: {e}")
+            await context.bot.send_photo(chat_id, photo=file_id, caption=caption)
+        except Exception:
+            try:
+                await context.bot.send_document(chat_id, document=file_id, caption=caption)
+            except Exception as e:
+                logging.error(f"Failed to send file to {chat_id}: {e}")
+
+    # Send mockups
+    mockup_count: int = len(design.mockup_file_ids)
+    for i, fid in enumerate(design.mockup_file_ids):
+        cap: str = f"🖼 موکاپ {i+1}/{mockup_count} — {code}"
+        await send_file_safe(user_id, fid, cap)
+        await asyncio.sleep(0.3)  # Rate limiting
 
     # Send print files
-    unique_prints = list(dict.fromkeys(design.print_file_ids))
+    unique_prints: list = list(dict.fromkeys(design.print_file_ids))
+    print_count: int = len(unique_prints)
     for i, fid in enumerate(unique_prints):
+        cap: str = f"🖨 فایل چاپی {i+1}/{print_count} — {code}"
         try:
-            cap = f"🖨 فایل چاپی {i+1} — {code}"
             await context.bot.send_document(user_id, document=fid, caption=cap)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
         except Exception as e:
             logging.error(f"Failed to send print {i} to {user_id}: {e}")
+
+    # Completion message
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"✅ تمام فایل‌های طرح {code} ارسال شد."
+    )

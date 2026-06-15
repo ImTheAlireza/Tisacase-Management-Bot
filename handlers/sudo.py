@@ -9,11 +9,24 @@ from models.user import User
 from models.product_line import ProductLine
 from services.backup_service import BackupService
 from utils.helpers import get_tehran_time
-from config.settings import SUDO_USER_ID
+from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS
+from utils.enums import DesignStatus
+
+
+def _verify_sudo_for_group_input(user_id):
+    """Helper to verify sudo access for group input flow"""
+    from config.settings import SUDO_USER_ID
+    from models.user import User
+    
+    if user_id != SUDO_USER_ID:
+        return False
+    
+    user = User.get_by_id(user_id)
+    return user and user.is_sudo
 
 
 @require_sudo
-async def switch_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def switch_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = context.user_data['db_user']
     keyboard = [
         [InlineKeyboardButton("👑 Sudo (کامل)", callback_data="role_sudo")],
@@ -29,7 +42,7 @@ async def switch_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @require_sudo
-async def handle_role_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_role_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
     ALLOWED_ROLES = {'sudo', 'editor', 'reviewer'}
@@ -45,16 +58,33 @@ async def handle_role_switch(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user.update_active_role(new_role)
 
     from ui.keyboards import Keyboards
-    await query.message.delete()
-    await context.bot.send_message(
-        chat_id=query.from_user.id,
-        text=f"✅ نقش شما به {new_role.upper()} تغییر یافت.",
-        reply_markup=Keyboards.get_main_menu(user)
-    )
-
+    
+    # FIX: Try to delete message, but don't fail if it's already gone
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logging.warning(f"Could not delete role switch message: {e}")
+    
+    # Send new message with updated keyboard
+    try:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=f"✅ نقش شما به {new_role.upper()} تغییر یافت.",
+            reply_markup=Keyboards.get_main_menu(user)
+        )
+    except Exception as e:
+        logging.error(f"Failed to send role switch confirmation: {e}")
+        # Fallback: edit the original message if delete failed
+        try:
+            await query.edit_message_text(
+                f"✅ نقش شما به {new_role.upper()} تغییر یافت.\n\n"
+                f"برای دیدن منوی جدید /start بزنید."
+            )
+        except Exception as e2:
+            logging.error(f"Role switch message update fallback also failed: {e2}")
 
 @require_sudo
-async def manual_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def manual_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("⏳ در حال تهیه بکاپ کامل... لطفاً صبر کنید.")
 
     zip_path = await BackupService.create_daily_backup_zip()
@@ -78,7 +108,7 @@ async def manual_backup_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 @require_sudo
-async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [[
         InlineKeyboardButton("✅ ریستارت کن", callback_data="confirm_restart"),
         InlineKeyboardButton("❌ انصراف", callback_data="cancel_restart")
@@ -88,9 +118,8 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
 @require_sudo
-async def execute_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def execute_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
@@ -102,8 +131,9 @@ async def execute_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            'supervisorctl', '-c', '/home/selfnit4/supervisord.conf', 'restart', 'tisa_bot',
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            'supervisorctl', '-c', SUPERVISORD_CONF, 'restart', SUPERVISOR_PROCESS,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         await asyncio.wait_for(proc.communicate(), timeout=30)
     except Exception as e:
@@ -111,11 +141,11 @@ async def execute_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_sudo
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         import subprocess
         result = subprocess.run(
-            ['supervisorctl', '-c', '/home/selfnit4/supervisord.conf', 'status', 'tisa_bot'],
+            ['supervisorctl', '-c', SUPERVISORD_CONF, 'status', SUPERVISOR_PROCESS],
             capture_output=True, text=True, check=True, timeout=10
         )
         await update.message.reply_text(
@@ -126,8 +156,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ خطا در دریافت وضعیت: {e}")
 
 
+
 @require_sudo
-async def broadcast_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def broadcast_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     
@@ -155,7 +186,7 @@ async def broadcast_update_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 @require_sudo
-async def group_management_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def group_management_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ProductLine.get_all()
     if not lines:
         await update.message.reply_text("هیچ خط تولیدی وجود ندارد.")
@@ -188,7 +219,7 @@ async def group_management_command(update: Update, context: ContextTypes.DEFAULT
 
 
 @require_sudo
-async def group_management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def group_management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -272,19 +303,22 @@ async def group_management_callback(update: Update, context: ContextTypes.DEFAUL
         )
 
 
-async def handle_group_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_group_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     pending = context.user_data.get('awaiting_group_input')
     if not pending:
         return False
 
-    text = update.message.text.strip()
+    if not _verify_sudo_for_group_input(update.effective_user.id):
+        await update.message.reply_text("🚫 دسترسی غیرمجاز.")
+        context.user_data.pop('awaiting_group_input', None)
+        return True
 
+    from utils.validators import Validators, ValidationError
     try:
-        chat_id = int(text)
-    except ValueError:
+        chat_id = Validators.validate_chat_id(update.message.text.strip())
+    except ValidationError as e:
         await update.message.reply_text(
-            "❌ فرمت نادرست. لطفاً یک عدد صحیح وارد کنید (مثال: -1001234567890)\n"
-            "برای لغو /cancel بزنید."
+            f"{e}\nبرای لغو /cancel بزنید."
         )
         return True
 

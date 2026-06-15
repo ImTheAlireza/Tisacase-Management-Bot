@@ -1,6 +1,7 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from models.product_line import ProductLine
-from config.settings import SUDO_USER_ID, NAZI_CHAT_ID
+from models.user import User
+from utils.enums import DesignStatus
 
 
 class Keyboards:
@@ -10,7 +11,8 @@ class Keyboards:
         role = user.get_effective_role()
         product_lines = ProductLine.get_all_active()
         keyboard = []
-        privileged = user.user_id in (SUDO_USER_ID, NAZI_CHAT_ID)
+        # FIX: Use centralized method
+        privileged = User.is_privileged_user(user.user_id)
 
         # Design submission buttons — editors and sudo
         if role in ['sudo', 'editor']:

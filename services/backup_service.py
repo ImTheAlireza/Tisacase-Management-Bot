@@ -6,32 +6,62 @@ import json
 import shutil
 import pymysql
 import logging
+import asyncio  # ADD THIS
 from datetime import datetime
-from config.database import get_db_connection, DB_CONFIG
+from config.database import get_db_connection
+from config.settings import DB_CONFIG
 from utils.helpers import get_tehran_time
-
+from utils.enums import DesignStatus
 
 class BackupService:
 
     @staticmethod
     def create_database_backup():
+        """
+        FIX: Use MySQL config file to avoid password in process list
+        """
         try:
-            dump_cmd = [
-                'mysqldump',
-                '-h', DB_CONFIG['host'],
-                '-u', DB_CONFIG['user'],
-                f"-p{DB_CONFIG['password']}",
-                DB_CONFIG['database'],
-                '--single-transaction',
-                '--routines',
-                '--triggers',
-                '--add-drop-table'
-            ]
-            result = subprocess.run(
-                dump_cmd, capture_output=True, text=True,
-                check=True, timeout=300
-            )
-            return result.stdout
+            # Create temporary MySQL config file
+            temp_dir = tempfile.mkdtemp()
+            config_file = os.path.join(temp_dir, 'my.cnf')
+            
+            try:
+                # Write credentials to config file with secure permissions
+                with open(config_file, 'w') as f:
+                    f.write('[client]\n')
+                    f.write(f"host={DB_CONFIG['host']}\n")
+                    f.write(f"user={DB_CONFIG['user']}\n")
+                    f.write(f"password={DB_CONFIG['password']}\n")
+                
+                # Set file permissions to 600 (owner read/write only)
+                os.chmod(config_file, 0o600)
+                
+                # Run mysqldump using the config file
+                dump_cmd = [
+                    'mysqldump',
+                    f"--defaults-file={config_file}",
+                    DB_CONFIG['database'],
+                    '--single-transaction',
+                    '--routines',
+                    '--triggers',
+                    '--add-drop-table'
+                ]
+                
+                result = subprocess.run(
+                    dump_cmd, capture_output=True, text=True,
+                    check=True, timeout=300
+                )
+                
+                return result.stdout
+                
+            finally:
+                # Clean up temp config file
+                try:
+                    os.remove(config_file)
+                    os.rmdir(temp_dir)
+                except Exception as e:
+                    logging.warning(f"Failed to cleanup temp mysqldump config: {e}")
+                    
         except subprocess.TimeoutExpired:
             logging.error("Database backup timed out (>5 minutes)")
             return None
@@ -44,6 +74,15 @@ class BackupService:
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
+            from datetime import datetime, date
+            
+            # FIX: Custom JSON encoder for dates
+            def json_serial(obj):
+                """JSON serializer for objects not serializable by default json code"""
+                if isinstance(obj, (datetime, date)):
+                    return obj.isoformat()
+                return str(obj)
+            
             codes_data = {}
             cursor.execute("SELECT * FROM product_lines ORDER BY display_order")
             product_lines = cursor.fetchall()
@@ -76,7 +115,8 @@ class BackupService:
                 """, (pl['id'],))
                 codes_data[prefix]['locked_codes'] = cursor.fetchall()
 
-            return json.dumps(codes_data, ensure_ascii=False, indent=2, default=str)
+            # FIX: Use custom serializer
+            return json.dumps(codes_data, ensure_ascii=False, indent=2, default=json_serial)
         except Exception as e:
             logging.error(f"Codes export failed: {e}")
             return None
@@ -107,9 +147,9 @@ class BackupService:
             for row in cursor.fetchall():
                 stats['product_lines'][row['code_prefix']] = {
                     'name': row['name_fa'],
-                    'pending': row['pending'] or 0,
-                    'approved': row['approved'] or 0,
-                    'rejected': row['rejected'] or 0
+                    DesignStatus.PENDING: row[DesignStatus.PENDING] or 0,
+                    DesignStatus.APPROVED: row[DesignStatus.APPROVED] or 0,
+                    DesignStatus.REJECTED: row[DesignStatus.REJECTED] or 0
                 }
 
             cursor.execute("""
@@ -136,62 +176,80 @@ class BackupService:
         zip_path = os.path.join(temp_dir, zip_filename)
 
         try:
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                logging.info("Creating database dump...")
-                sql_dump = BackupService.create_database_backup()
-                if sql_dump:
-                    zipf.writestr(f"database_{timestamp}.sql", sql_dump)
-                    logging.info(f"✅ Database dump added ({len(sql_dump)} bytes)")
-                else:
-                    logging.warning("⚠️ Database dump failed, skipping")
+            # FIX: Run blocking operations in executor
+            loop = asyncio.get_event_loop()
+            
+            logging.info("Creating database dump...")
+            sql_dump = await loop.run_in_executor(
+                None, BackupService.create_database_backup
+            )
+            
+            codes_json = await loop.run_in_executor(
+                None, BackupService.create_codes_export
+            )
+            
+            stats = await loop.run_in_executor(
+                None, BackupService.get_stats_summary
+            )
+            
+            # FIX: Wrap the entire ZIP creation in executor since it's all blocking I/O
+            def create_zip_file():
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    if sql_dump:
+                        zipf.writestr(f"database_{timestamp}.sql", sql_dump)
+                        logging.info(f"✅ Database dump added ({len(sql_dump)} bytes)")
+                    else:
+                        logging.warning("⚠️ Database dump failed, skipping")
 
-                codes_json = BackupService.create_codes_export()
-                if codes_json:
-                    zipf.writestr(f"codes_{timestamp}.json", codes_json)
+                    if codes_json:
+                        zipf.writestr(f"codes_{timestamp}.json", codes_json)
 
-                conn = get_db_connection()
-                cursor = conn.cursor(pymysql.cursors.DictCursor)
-                cursor.execute("SELECT * FROM schema_migrations ORDER BY applied_at")
-                migrations = cursor.fetchall()
-                cursor.close()
-                conn.close()
-                zipf.writestr(
-                    f"migrations_{timestamp}.json",
-                    json.dumps(migrations, default=str, indent=2, ensure_ascii=False)
-                )
+                    conn = get_db_connection()
+                    cursor = conn.cursor(pymysql.cursors.DictCursor)
+                    cursor.execute("SELECT * FROM schema_migrations ORDER BY applied_at")
+                    migrations = cursor.fetchall()
+                    cursor.close()
+                    conn.close()
+                    zipf.writestr(
+                        f"migrations_{timestamp}.json",
+                        json.dumps(migrations, default=str, indent=2, ensure_ascii=False)
+                    )
 
-                stats = BackupService.get_stats_summary()
-                zipf.writestr(
-                    f"stats_{timestamp}.json",
-                    json.dumps(stats, ensure_ascii=False, indent=2)
-                )
+                    zipf.writestr(
+                        f"stats_{timestamp}.json",
+                        json.dumps(stats, ensure_ascii=False, indent=2)
+                    )
 
-                # Add Public Directory Recursively
-                public_dir = '/home/selfnit4/self/public'
-                if os.path.exists(public_dir):
-                    logging.info("Adding public directory to backup...")
-                    for foldername, subfolders, filenames in os.walk(public_dir):
-                        for filename in filenames:
-                            file_path = os.path.join(foldername, filename)
-                            arcname = os.path.join('public', os.path.relpath(file_path, public_dir))
-                            zipf.write(file_path, arcname)
-                    logging.info("✅ Public directory appended natively to ZIP")
-                else:
-                    logging.warning(f"⚠️ Public directory {public_dir} not found to Zip")
+                    # Add Public Directory Recursively
+                    public_dir = '/home/selfnit4/self/public'
+                    if os.path.exists(public_dir):
+                        logging.info("Adding public directory to backup...")
+                        for foldername, subfolders, filenames in os.walk(public_dir):
+                            for filename in filenames:
+                                file_path = os.path.join(foldername, filename)
+                                arcname = os.path.join('public', os.path.relpath(file_path, public_dir))
+                                zipf.write(file_path, arcname)
+                        logging.info("✅ Public directory appended natively to ZIP")
+                    else:
+                        logging.warning(f"⚠️ Public directory {public_dir} not found to Zip")
 
-                metadata = {
-                    'created_at': now_tehran.isoformat(),
-                    'version': '2.0',
-                    'files_included': [
-                        'database_dump.sql', 'codes_export.json',
-                        'migrations.json', 'stats.json', 'public/'
-                    ]
-                }
-                zipf.writestr('metadata.json', json.dumps(metadata, indent=2))
+                    metadata = {
+                        'created_at': now_tehran.isoformat(),
+                        'version': '2.0',
+                        'files_included': [
+                            'database_dump.sql', 'codes_export.json',
+                            'migrations.json', 'stats.json', 'public/'
+                        ]
+                    }
+                    zipf.writestr('metadata.json', json.dumps(metadata, indent=2))
 
-            file_size = os.path.getsize(zip_path)
-            logging.info(f"✅ Backup ZIP created: {zip_filename} ({file_size} bytes)")
-            return zip_path
+                file_size = os.path.getsize(zip_path)
+                logging.info(f"✅ Backup ZIP created: {zip_filename} ({file_size} bytes)")
+                return zip_path
+            
+            # Run ZIP creation in executor
+            result = await loop.run_in_executor(None, create_zip_file)
+            return result
 
         except Exception as e:
             logging.error(f"❌ Backup ZIP creation failed: {e}")
@@ -211,9 +269,9 @@ async def send_daily_backup(context):
     for prefix, data in stats.get('product_lines', {}).items():
         lines.append(
             f"\n{data['name']} ({prefix})\n"
-            f"  ⏳ در انتظار: {data['pending']}\n"
-            f"  ✅ تایید: {data['approved']}\n"
-            f"  ❌ رد: {data['rejected']}"
+            f"  ⏳ در انتظار: {data[DesignStatus.PENDING]}\n"
+            f"  ✅ تایید: {data[DesignStatus.APPROVED]}\n"
+            f"  ❌ رد: {data[DesignStatus.REJECTED]}"
         )
     log_text = '\n'.join(lines)
 

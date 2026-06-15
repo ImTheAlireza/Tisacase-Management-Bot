@@ -1,19 +1,20 @@
 from functools import wraps
+from typing import Callable
 from models.user import User
 import logging
 
 
-def require_role(*allowed_roles):
+def require_role(*allowed_roles: str) -> Callable:
     """
     Decorator to check if user has required role.
     Fetches a fresh user from DB on every call.
-    Sudo always has access to everything regardless of active role.
+    Sudo always has access regardless of active role.
     """
-    def decorator(func):
+    def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(update, context, *args, **kwargs):
-            user_id = update.effective_user.id
-            user = User.get_by_id(user_id)
+            user_id: int = update.effective_user.id
+            user: User | None = User.get_by_id(user_id)
 
             if not user or not user.is_active:
                 if update.message:
@@ -22,9 +23,8 @@ def require_role(*allowed_roles):
                     await update.callback_query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
                 return
 
-            effective_role = user.get_effective_role()
+            effective_role: str = user.get_effective_role()
 
-            # Sudo always passes role checks regardless of active role
             if not user.is_sudo and effective_role not in allowed_roles:
                 msg = "🚫 این بخش فقط برای نقش‌های زیر است:\n" + ", ".join(allowed_roles)
                 if update.message:
@@ -39,16 +39,15 @@ def require_role(*allowed_roles):
     return decorator
 
 
-def require_sudo(func):
+def require_sudo(func: Callable) -> Callable:
     """
     Decorator that requires the user to be a sudo user.
-    Checks user.is_sudo directly — NOT effective_role —
-    so sudo can use sudo commands even when acting as editor or reviewer.
+    Checks user.is_sudo directly — NOT effective_role.
     """
     @wraps(func)
     async def wrapper(update, context, *args, **kwargs):
-        user_id = update.effective_user.id
-        user = User.get_by_id(user_id)
+        user_id: int = update.effective_user.id
+        user: User | None = User.get_by_id(user_id)
 
         if not user or not user.is_active:
             if update.message:

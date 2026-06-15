@@ -4,14 +4,12 @@ from telegram.ext import ContextTypes
 from utils.decorators import require_sudo
 from models.user import User
 from models.product_line import ProductLine
-
+from config.database import get_db_connection  # FIX: Add proper import
+from utils.enums import DesignStatus
+from utils.validators import Validators, ValidationError
 
 @require_sudo
-async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /adduser {user_id} {role} {name}
-    Example: /adduser 123456789 editor علی
-    """
+async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if len(args) < 3:
         await update.message.reply_text(
@@ -19,6 +17,14 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "استفاده: /adduser {user_id} {role} {name}\n"
             "مثال: /adduser 123456789 editor علی"
         )
+        return
+
+    try:
+        user_id   = Validators.validate_user_id(args[0])
+        role      = Validators.validate_role(args[1])
+        first_name = Validators.validate_name(' '.join(args[2:]), "نام")
+    except ValidationError as e:
+        await update.message.reply_text(str(e))
         return
 
     try:
@@ -45,7 +51,8 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         else:
             # Reactivate
-            conn = __import__('config.database', fromlist=['get_db_connection']).get_db_connection()
+            # FIX: Use proper import instead of __import__
+            conn = get_db_connection()
             cursor = conn.cursor()
             try:
                 cursor.execute("""
@@ -82,11 +89,7 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_sudo
-async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /removeuser {user_id}
-    Deactivates user — data is preserved.
-    """
+async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -94,6 +97,12 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             "استفاده: /removeuser {user_id}\n"
             "مثال: /removeuser 123456789"
         )
+        return
+
+    try:
+        user_id = Validators.validate_user_id(args[0])
+    except ValidationError as e:
+        await update.message.reply_text(str(e))
         return
 
     try:
@@ -128,7 +137,7 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @require_sudo
-async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /listusers
     Lists all active users grouped by role.
@@ -157,19 +166,21 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @require_sudo
-async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /setrole {user_id} {role}
-    Changes a user's role.
-    """
+async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
             "❌ فرمت نادرست\n"
             "استفاده: /setrole {user_id} {role}\n"
-            "نقش‌ها: editor, reviewer\n"
             "مثال: /setrole 123456789 reviewer"
         )
+        return
+
+    try:
+        user_id  = Validators.validate_user_id(args[0])
+        new_role = Validators.validate_role(args[1])
+    except ValidationError as e:
+        await update.message.reply_text(str(e))
         return
 
     try:
@@ -194,7 +205,8 @@ async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     old_role = user.role
 
-    conn = __import__('config.database', fromlist=['get_db_connection']).get_db_connection()
+    # FIX: Use proper import
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
@@ -213,13 +225,12 @@ async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"قبلی: {old_role} → جدید: {new_role}"
     )
 
-
 # ---------------------------------------------------------------------------
 # Product line management commands
 # ---------------------------------------------------------------------------
 
 @require_sudo
-async def list_lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /listlines
     Shows all product lines with status and group configuration.
@@ -244,11 +255,7 @@ async def list_lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @require_sudo
-async def add_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /addline {prefix} {name_fa} {icon}
-    Example: /addline MG ماگ ☕
-    """
+async def add_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if len(args) < 3:
         await update.message.reply_text(
@@ -256,6 +263,14 @@ async def add_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "استفاده: /addline {prefix} {name_fa} {icon}\n"
             "مثال: /addline MG ماگ ☕"
         )
+        return
+
+    try:
+        prefix  = Validators.validate_product_line_prefix(args[0])
+        icon    = Validators.validate_icon(args[-1])
+        name_fa = Validators.validate_product_name(' '.join(args[1:-1]))
+    except ValidationError as e:
+        await update.message.reply_text(str(e))
         return
 
     prefix = args[0].upper()
@@ -291,7 +306,7 @@ async def add_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_sudo
-async def disable_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def disable_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /disableline {prefix}
     """
@@ -314,7 +329,7 @@ async def disable_line_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 @require_sudo
-async def enable_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def enable_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /enableline {prefix}
     """
@@ -350,15 +365,23 @@ async def enable_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ---------------------------------------------------------------------------
 
 @require_sudo
-async def lock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /lockcode {code}
-    Example: /lockcode TS050
-    """
+async def lock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
         await update.message.reply_text("استفاده: /lockcode {code}\nمثال: /lockcode TS050")
         return
+
+    from models.product_line import ProductLine
+    lines = ProductLine.get_all()
+    valid_prefixes = [pl.code_prefix for pl in lines]
+
+    try:
+        code = Validators.validate_design_code(args[0], valid_prefixes)
+    except ValidationError as e:
+        await update.message.reply_text(str(e))
+        return
+
+    notes = ' '.join(args[1:]) if len(args) > 1 else None
 
     code = args[0].upper()
     notes = ' '.join(args[1:]) if len(args) > 1 else None
@@ -392,7 +415,7 @@ async def lock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_sudo
-async def unlock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unlock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /unlockcode {code}
     """
@@ -414,7 +437,7 @@ async def unlock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @require_sudo
-async def locked_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def locked_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /lockedcodes [prefix]
     """

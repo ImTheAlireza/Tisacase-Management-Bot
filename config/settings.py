@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 import logging
+from utils.enums import DesignStatus
 
 load_dotenv()
 
@@ -12,13 +13,6 @@ SUDO_USER_ID = int(os.getenv("MAIN_ALIREZA_CHAT_ID"))
 NAZI_CHAT_ID = int(os.getenv("MAIN_NAZI_CHAT_ID"))
 LOG_GROUP_ID = int(os.getenv("MAIN_LOG_GROUP_ID"))
 
-# Legacy variable names for compatibility
-DESIGNER_CHAT_ID = SUDO_USER_ID
-
-# NOTE: GROUP_PRODUCTS and GROUP_PRINT have been removed.
-# Each product line now stores its own group IDs in the database.
-# Configure them via the bot's group management menu (Sudo → تنظیم گروه‌ها).
-
 # ==================== DATABASE CONFIGURATION ====================
 DB_CONFIG = {
     'host': os.getenv('MAIN_DB_HOST', 'localhost'),
@@ -26,6 +20,9 @@ DB_CONFIG = {
     'password': os.getenv('MAIN_DB_PASSWORD'),
     'database': os.getenv('MAIN_DB_NAME'),
     'charset': 'utf8mb4',
+    'connect_timeout': 20,
+    'read_timeout': 30,
+    'write_timeout': 30,
 }
 
 # ==================== TIMEZONE ====================
@@ -57,7 +54,7 @@ DEFAULT_PRODUCT_LINES = [
         'code_prefix': 'TB',
         'name_en': 'frame',
         'name_fa': 'قاب تابلو',
-        'icon': '🖼️',
+        'icon': '🖼',
         'code_format': 'TB{counter:03d}',
         'counter_start': 1,
         'counter_end': 999,
@@ -101,11 +98,11 @@ ROLES = {
     },
     'editor': {
         'permissions': ['create_design', 'upload_files', 'view_own_designs'],
-        'display_name': '🎨 Editor'
+        'display_name': '✏️ Editor'
     },
     'reviewer': {
         'permissions': ['approve_design', 'reject_design', 'view_pending'],
-        'display_name': '✅ Reviewer'
+        'display_name': '👁 Reviewer'
     }
 }
 
@@ -115,9 +112,15 @@ BACKUP_TIME_MINUTE = 59
 
 # ==================== FILE SETTINGS ====================
 MAX_FILE_SIZE_MB = 20
-ALLOWED_FILE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf',
-                      'application/x-photoshop', 'application/postscript']
+ALLOWED_FILE_TYPES = [
+    'image/jpeg', 'image/png', 'image/webp',
+    'application/pdf', 'application/x-photoshop', 'application/postscript'
+]
 
 # ==================== LOGGING ====================
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# ==================== SUPERVISOR SETTINGS ====================
+SUPERVISORD_CONF = '/home/selfnit4/supervisord.conf'
+SUPERVISOR_PROCESS = 'tisa_bot'

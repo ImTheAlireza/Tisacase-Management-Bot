@@ -1,4 +1,5 @@
 import logging
+from utils.enums import DesignStatus
 
 
 class Migration007:

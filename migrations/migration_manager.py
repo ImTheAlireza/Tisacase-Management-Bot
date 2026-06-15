@@ -2,6 +2,7 @@ import pymysql
 import logging
 from datetime import datetime
 from config.database import get_db_connection
+from utils.enums import DesignStatus
 
 class MigrationManager:
     """Manages database schema migrations"""

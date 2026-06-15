@@ -1,5 +1,6 @@
 import logging
 import json
+from utils.enums import DesignStatus
 
 
 class Migration005:

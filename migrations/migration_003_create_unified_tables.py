@@ -1,4 +1,5 @@
 import logging
+from utils.enums import DesignStatus
 
 class Migration003:
     """Create unified designs and locked_codes tables"""

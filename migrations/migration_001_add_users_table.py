@@ -1,5 +1,6 @@
 from config.settings import SUDO_USER_ID, NAZI_CHAT_ID
 import logging
+from utils.enums import DesignStatus
 
 class Migration001:
     """Create users table and insert initial users"""

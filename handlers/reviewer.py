@@ -9,10 +9,22 @@ from utils.helpers import safe_edit_message, delete_messages
 from config.settings import SUDO_USER_ID
 import logging
 from io import BytesIO
+from utils.enums import DesignStatus
+from utils.callback_lock import deduplicate_callback
+
+
+def _review_key(update, context) -> str:
+    """Lock key: action + code e.g. 'approve_TS001'"""
+    # Locks per code regardless of approve/reject
+    # so two reviewers can't both approve simultaneously
+    code = update.callback_query.data.split('_', 1)[1]
+    return f"review_{code}"
 
 
 @require_role('reviewer', 'sudo')
-async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@deduplicate_callback(_review_key)
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
     query = update.callback_query
     await query.answer()
 
@@ -20,13 +32,35 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, code = query.data.split('_', 1)
 
     design = Design.get_by_code(code)
+    
+    # FIX: Explicit validation with clear error messages
     if not design:
-        await safe_edit_message(query, "❌ این طرح یافت نشد.")
+        await _delete_my_messages(context.bot, user.user_id, design) if design else None
+        await safe_edit_message(query, f"❌ طرح با کد {code} در سیستم یافت نشد.")
+        return
+    
+    if design.id is None:
+        await _delete_my_messages(context.bot, user.user_id, design)
+        await safe_edit_message(query, "❌ خطای داخلی: طرح بدون شناسه (ID) است. به Sudo اطلاع دهید.")
+        logging.error(f"Design {code} has id=None in review_callback")
         return
 
-    if design.status != 'pending':
+    if design.status != DesignStatus.PENDING:
+        status_map = {
+            DesignStatus.APPROVED: 'تایید شده',
+            DesignStatus.REJECTED: 'رد شده',
+            DesignStatus.DELETED: 'حذف شده'
+        }
+        status_fa = status_map.get(design.status, design.status)
+        reviewer_name = design.reviewer_name or "ناظر دیگر"
+        
         await _delete_my_messages(context.bot, user.user_id, design)
-        await safe_edit_message(query, "⚠️ این طرح قبلاً پردازش شده است.")
+        await safe_edit_message(
+            query,
+            f"⚠️ این طرح قبلاً پردازش شده است.\n"
+            f"وضعیت: {status_fa}\n"
+            f"توسط: {reviewer_name}"
+        )
         return
 
     await safe_edit_message(query, "⏳ در حال پردازش...")
@@ -37,8 +71,16 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         won = design.approve(user.user_id, user.first_name)
 
         if not won:
+            # FIX: More specific error - fetch fresh design to see who won
+            fresh_design = Design.get_by_code(code)
+            other_reviewer = fresh_design.reviewer_name if fresh_design else "ناظر دیگر"
+            
             await _delete_my_messages(context.bot, user.user_id, design)
-            await safe_edit_message(query, "⚠️ این طرح قبلاً توسط ناظر دیگری پردازش شده است.")
+            await safe_edit_message(
+                query,
+                f"⚠️ این طرح همین الان توسط {other_reviewer} پردازش شد.\n"
+                f"شما کمی دیر رسیدید."
+            )
             return
 
         if not product_line or not product_line.is_fully_configured():
@@ -76,16 +118,33 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             unique_prints = list(dict.fromkeys(design.print_file_ids))
             for i, fid in enumerate(unique_prints):
                 try:
+                    # FIX: Try to use copy_message for efficiency (requires message_id)
+                    # Since we don't have the original message_id, we must download and re-upload
+                    # But we can at least optimize the filename generation
+                    
                     file = await context.bot.get_file(fid)
-                    file_bytes = await file.download_as_bytearray()
-                    ext = (file.file_path.split('.')[-1].lower()
-                           if '.' in file.file_path else 'png')
-                    new_filename = (f"{code}.{ext}" if len(unique_prints) == 1
-                                   else f"{code}_{i+1}.{ext}")
-                    m = await context.bot.send_document(
-                        product_line.group_print,
-                        document=InputFile(BytesIO(file_bytes), filename=new_filename)
-                    )
+                    
+                    # Check file size - if over 20MB, Telegram API can't download it
+                    if file.file_size and file.file_size > 20 * 1024 * 1024:
+                        logging.warning(f"Print file {i} for {code} is too large ({file.file_size} bytes), skipping download")
+                        # Send with original filename
+                        m = await context.bot.send_document(
+                            product_line.group_print,
+                            document=fid,
+                            caption=f"⚠️ {code} - فایل بزرگ (نام تغییر نکرد)"
+                        )
+                    else:
+                        # Download and rename for files under 20MB
+                        file_bytes = await file.download_as_bytearray()
+                        ext = (file.file_path.split('.')[-1].lower()
+                               if file.file_path and '.' in file.file_path else 'png')
+                        new_filename = (f"{code}.{ext}" if len(unique_prints) == 1
+                                       else f"{code}_{i+1}.{ext}")
+                        m = await context.bot.send_document(
+                            product_line.group_print,
+                            document=InputFile(BytesIO(file_bytes), filename=new_filename)
+                        )
+                    
                     DesignGroupMessage.record(
                         design_id=design.id,
                         code=code,
@@ -108,7 +167,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Failed to notify editor: {e}")
 
         # Notify sudo
-        await _notify_sudo(context.bot, design, product_line, user, action='approved')
+        await _notify_sudo(context.bot, design, product_line, user, action=DesignStatus.APPROVED)
 
         # Delete other reviewers' messages, then edit acting reviewer's, then clean up
         await _delete_other_reviewer_messages(context.bot, design, user.user_id)
@@ -133,7 +192,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Failed to notify editor: {e}")
 
         # Notify sudo
-        await _notify_sudo(context.bot, design, product_line, user, action='rejected')
+        await _notify_sudo(context.bot, design, product_line, user, action=DesignStatus.REJECTED)
 
         await _delete_other_reviewer_messages(context.bot, design, user.user_id)
         await safe_edit_message(query, f"❌ رد شد: {code}")
@@ -144,23 +203,23 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _delete_my_messages(bot, reviewer_user_id, design):
+async def _delete_my_messages(bot, reviewer_user_id: int, design: Design) -> None:
     """Delete only this reviewer's messages"""
     msg_ids = design.get_reviewer_messages(reviewer_user_id)
     if msg_ids:
         await delete_messages(bot, reviewer_user_id, msg_ids)
 
 
-async def _delete_other_reviewer_messages(bot, design, acting_reviewer_id):
+async def _delete_other_reviewer_messages(bot, design: Design, acting_reviewer_id: int) -> None:
     """Delete messages from all reviewers EXCEPT the one who acted"""
     for reviewer_user_id, msg_ids in design.all_reviewer_message_pairs():
         if reviewer_user_id != acting_reviewer_id and msg_ids:
             await delete_messages(bot, reviewer_user_id, msg_ids)
 
 
-async def _notify_sudo(bot, design, product_line, acting_reviewer, action):
+async def _notify_sudo(bot, design: Design, product_line, acting_reviewer, action: DesignStatus) -> None:
     """Send approval/rejection detail to sudo"""
-    action_text = "✅ تایید" if action == 'approved' else "❌ رد"
+    action_text = "✅ تایید" if action == DesignStatus.APPROVED else "❌ رد"
     product_name = product_line.name_fa if product_line else f"ID:{design.product_line_id}"
 
     try:

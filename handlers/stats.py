@@ -5,11 +5,13 @@ from config.settings import SUDO_USER_ID, NAZI_CHAT_ID
 from services.stats_service import StatsService
 from models.design import Design
 from models.user import User
+from utils.enums import DesignStatus
 
 
 def is_privileged(user_id):
     """Only sudo and Nazi see the full stats system"""
-    return user_id in (SUDO_USER_ID, NAZI_CHAT_ID)
+    # FIX: Use centralized method
+    return User.is_privileged_user(user_id)
 
 
 def _main_markup():
@@ -27,7 +29,7 @@ def _back_markup():
     ])
 
 
-async def stats_command(update: Update, context):
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not is_privileged(user_id):
         await update.message.reply_text("🚫 دسترسی غیرمجاز.")
@@ -39,7 +41,7 @@ async def stats_command(update: Update, context):
     )
 
 
-async def stats_callback(update: Update, context):
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
@@ -78,7 +80,7 @@ async def stats_callback(update: Update, context):
 
 
 
-def _build_lines_text():
+def _build_lines_text() -> str:
     try:
         rows = StatsService.get_product_line_stats()
     except Exception as e:
@@ -96,6 +98,9 @@ def _build_lines_text():
         appr_str = ", ".join(r['recent_approved']) if r['recent_approved'] else "هیچ"
         rej_str = ", ".join(r['recent_rejected']) if r['recent_rejected'] else "هیچ"
         
+        # FIX: Show deleted count if > 0
+        deleted_line = f"  🗑 حذف شده:  {r['deleted_all']}\n" if r.get('deleted_all', 0) > 0 else ""
+        
         lines.append(
             f"\n{active} {r['icon']} {r['name_fa']} ({r['code_prefix']})\n"
             f"  ⏳ کدهای در انتظار: {pending_str}\n"
@@ -103,12 +108,13 @@ def _build_lines_text():
             f"  ❌ ۱۰ رد اخیر: {rej_str}\n"
             f"  امروز:  ثبت {r['submitted_today']} | تایید {r['approved_today']} | رد {r['rejected_today']}\n"
             f"  هفته:   ثبت {r['submitted_week']} | تایید {r['approved_week']} | رد {r['rejected_week']}\n"
-            f"  کل:     ثبت {r['total_all']} | تایید {r['approved_all']} | رد {r['rejected_all']} | انتظار {r['pending_all']}"
+            f"  کل:     ثبت {r['total_all']} | تایید {r['approved_all']} | رد {r['rejected_all']} | انتظار {r['pending_all']}\n"
+            f"{deleted_line}"
         )
     return '\n'.join(lines)
 
 
-def _build_users_text():
+def _build_users_text() -> str:
     try:
         editors = StatsService.get_editor_stats()
         reviewers = StatsService.get_reviewer_stats()
@@ -147,7 +153,7 @@ def _build_users_text():
     return '\n'.join(lines)
 
 
-def _build_top_text():
+def _build_top_text() -> str:
     try:
         top = StatsService.get_top_performers()
     except Exception as e:
@@ -185,7 +191,7 @@ def _build_top_text():
     return '\n'.join(lines)
 
 
-def _build_system_text():
+def _build_system_text() -> str:
     try:
         data = StatsService.get_system_stats()
     except Exception as e:
@@ -201,9 +207,9 @@ def _build_system_text():
         "",
         "📊 کل طرح‌ها:",
         f"  امروز ثبت شده:  {t['submitted_today']}",
-        f"  در انتظار:       {t['pending']}",
-        f"  تایید شده:       {t['approved']}",
-        f"  رد شده:          {t['rejected']}",
+        f"  در انتظار:       {t[DesignStatus.PENDING]}",
+        f"  تایید شده:       {t[DesignStatus.APPROVED]}",
+        f"  رد شده:          {t[DesignStatus.REJECTED]}",
         f"  مجموع کل:        {t['total']}",
         "",
         "👥 کاربران فعال:",

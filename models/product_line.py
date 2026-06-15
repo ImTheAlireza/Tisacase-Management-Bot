@@ -1,5 +1,6 @@
 import pymysql
 import logging
+from typing import Optional
 from config.database import get_db_connection
 from utils.helpers import get_tehran_time, to_utc_naive
 
@@ -7,12 +8,27 @@ from utils.helpers import get_tehran_time, to_utc_naive
 class ProductLine:
     """Product Line model for managing product types"""
 
-    def __init__(self, id, code_prefix, name_en, name_fa, icon='📦',
-                 code_format='{prefix}{counter:03d}', counter_start=1,
-                 counter_end=999, has_mockup=True, has_print_file=True,
-                 is_active=True, display_order=0, created_at=None,
-                 updated_at=None, metadata=None,
-                 group_products=None, group_print=None):
+    def __init__(
+        self,
+        id: Optional[int],
+        code_prefix: str,
+        name_en: str,
+        name_fa: str,
+        icon: str = '📦',
+        code_format: str = '{prefix}{counter:03d}',
+        counter_start: int = 1,
+        counter_end: int = 999,
+        has_mockup: bool = True,
+        has_print_file: bool = True,
+        is_active: bool = True,
+        display_order: int = 0,
+        created_at=None,
+        updated_at=None,
+        metadata=None,
+        group_products: Optional[int] = None,
+        group_print: Optional[int] = None,
+        **kwargs
+    ):
         self.id = id
         self.code_prefix = code_prefix
         self.name_en = name_en
@@ -30,12 +46,16 @@ class ProductLine:
         self.metadata = metadata
         self.group_products = group_products
         self.group_print = group_print
+        
+        # This MUST be inside __init__, not at class level
+        if kwargs:
+            logging.warning(f"ProductLine.__init__ received unknown kwargs: {list(kwargs.keys())}")
 
-    def is_fully_configured(self):
+    def is_fully_configured(self) -> bool:
         """Return True if both groups are set"""
         return self.group_products is not None and self.group_print is not None
 
-    def missing_groups(self):
+    def missing_groups(self) -> list[str]:
         """Return list of missing group names"""
         missing = []
         if self.group_products is None:
@@ -43,7 +63,8 @@ class ProductLine:
         if self.group_print is None:
             missing.append('group_print (گروه چاپ)')
         return missing
-
+        
+        
     @staticmethod
     def get_all_active():
         """Get all active product lines"""
@@ -76,15 +97,27 @@ class ProductLine:
             conn.close()
 
     @staticmethod
-    def get_by_prefix(code_prefix):
-        """Get product line by code prefix"""
+    def get_by_prefix(code_prefix, active_only=True):
+        """
+        Get product line by code prefix
+        
+        Args:
+            code_prefix: The prefix code (e.g. 'TS', 'STI')
+            active_only: If True, only return active lines (default: True)
+        """
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
-            cursor.execute("""
-                SELECT * FROM product_lines
-                WHERE code_prefix = %s AND is_active = TRUE
-            """, (code_prefix,))
+            if active_only:
+                cursor.execute("""
+                    SELECT * FROM product_lines
+                    WHERE code_prefix = %s AND is_active = TRUE
+                """, (code_prefix,))
+            else:
+                cursor.execute("""
+                    SELECT * FROM product_lines
+                    WHERE code_prefix = %s
+                """, (code_prefix,))
             row = cursor.fetchone()
             return ProductLine(**row) if row else None
         finally:
@@ -194,7 +227,7 @@ class ProductLine:
     def activate(self):
         self.update(is_active=True)
 
-    def get_stats(self):
+    def get_stats(self) -> dict:
         """Get statistics for this product line"""
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
@@ -215,7 +248,14 @@ class ProductLine:
                 FROM designs_locked_codes
                 WHERE product_line_id = %s AND is_manual = TRUE
             """, (self.id,))
+            
+            # FIX: Handle NULL values from SUM() when no rows exist
             stats['locked'] = cursor.fetchone()['locked_count']
+            
+            # Convert None to 0 for SUM results
+            stats['pending'] = stats['pending'] or 0
+            stats['approved'] = stats['approved'] or 0
+            stats['rejected'] = stats['rejected'] or 0
 
             return stats
         finally:

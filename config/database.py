@@ -1,18 +1,56 @@
 import pymysql
 import logging
+from pymysql.cursors import DictCursor
+from dbutils.pooled_db import PooledDB
 from config.settings import DB_CONFIG
 
-def get_db_connection():
-    """Create a database connection"""
+
+_pool: PooledDB | None = None
+
+
+def _get_pool() -> PooledDB:
+    """Initialize pool lazily (once) and return it."""
+    global _pool
+    if _pool is None:
+        _pool = PooledDB(
+            creator=pymysql,
+            maxconnections=10,
+            mincached=2,
+            maxcached=5,
+            maxshared=0,
+            blocking=True,
+            ping=1,
+            # Timeouts come from DB_CONFIG automatically
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            database=DB_CONFIG['database'],
+            charset=DB_CONFIG['charset'],
+            connect_timeout=DB_CONFIG['connect_timeout'],
+            read_timeout=DB_CONFIG['read_timeout'],
+            write_timeout=DB_CONFIG['write_timeout'],
+            autocommit=False,
+        )
+        logging.info(
+            f"✅ Database connection pool initialized "
+            f"(connect_timeout={DB_CONFIG['connect_timeout']}s, "
+            f"read_timeout={DB_CONFIG['read_timeout']}s, "
+            f"write_timeout={DB_CONFIG['write_timeout']}s)"
+        )
+    return _pool
+
+
+def get_db_connection() -> pymysql.connections.Connection:
+    """Get a connection from the pool."""
     try:
-        conn = pymysql.connect(**DB_CONFIG)
-        return conn
-    except pymysql.Error as e:
-        logging.error(f"❌ Database connection error: {e}")
+        return _get_pool().connection()
+    except Exception as e:
+        logging.error(f"❌ Failed to get connection from pool: {e}")
         raise
 
-def test_connection():
-    """Test database connection"""
+
+def test_connection() -> bool:
+    """Test database connectivity."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -25,16 +63,12 @@ def test_connection():
         logging.error(f"❌ Database connection test failed: {e}")
         return False
 
-def init_legacy_tables():
-    """
-    Create legacy tables if they don't exist
-    This ensures backward compatibility with existing data
-    """
+
+def init_legacy_tables() -> None:
+    """Create legacy tables if they don't exist."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     try:
-        # ============= Legacy Mobile Design Tables =============
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pending_designs (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -48,7 +82,6 @@ def init_legacy_tables():
                 INDEX idx_designer (designer_chat_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS design_log (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -61,15 +94,12 @@ def init_legacy_tables():
                 INDEX idx_status (status)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS locked_codes (
                 code VARCHAR(20) PRIMARY KEY,
                 locked_at DATETIME NOT NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
-
-        # ============= Legacy Sticker Tables =============
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pending_stickers (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -83,7 +113,6 @@ def init_legacy_tables():
                 INDEX idx_designer (designer_chat_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sticker_log (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -96,17 +125,14 @@ def init_legacy_tables():
                 INDEX idx_status (status)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS locked_sticker_codes (
                 code VARCHAR(20) PRIMARY KEY,
                 locked_at DATETIME NOT NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
-
         conn.commit()
         logging.info("✅ Legacy tables verified/created")
-        
     except Exception as e:
         logging.error(f"❌ Error creating legacy tables: {e}")
         conn.rollback()

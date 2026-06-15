@@ -1,5 +1,6 @@
 from config.settings import DEFAULT_PRODUCT_LINES
 import logging
+from utils.enums import DesignStatus
 
 class Migration002:
     """Create product_lines table and seed default products"""

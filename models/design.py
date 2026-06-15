@@ -2,25 +2,40 @@ import pymysql
 import json
 import logging
 import time
+from typing import Optional
 from config.database import get_db_connection
 from utils.helpers import get_tehran_time, to_utc_naive
+from utils.enums import DesignStatus
 
 
 class Design:
     """Design model for managing all product designs"""
 
-    def __init__(self, id, code, product_line_id, status='pending',
-                 editor_user_id=None, editor_name=None,
-                 reviewer_user_id=None, reviewer_name=None,
-                 mockup_file_ids=None, print_file_ids=None,
-                 mockup_message_ids_reviewer=None,
-                 created_at=None, reviewed_at=None,
-                 final_name=None, metadata=None,
-                 product_name=None, product_icon=None, **kwargs):
+    def __init__(
+        self,
+        id: Optional[int],
+        code: str,
+        product_line_id: int,
+        status: str = DesignStatus.PENDING,
+        editor_user_id: Optional[int] = None,
+        editor_name: Optional[str] = None,
+        reviewer_user_id: Optional[int] = None,
+        reviewer_name: Optional[str] = None,
+        mockup_file_ids: Optional[list] = None,
+        print_file_ids: Optional[list] = None,
+        mockup_message_ids_reviewer: Optional[dict] = None,
+        created_at=None,
+        reviewed_at=None,
+        final_name: Optional[str] = None,
+        metadata=None,
+        product_name: Optional[str] = None,
+        product_icon: Optional[str] = None,
+        **kwargs
+    ):
         self.id = id
         self.code = code
         self.product_line_id = product_line_id
-        self.status = status
+        self.status = DesignStatus(status) if isinstance(status, str) else status
         self.editor_user_id = editor_user_id
         self.editor_name = editor_name
         self.reviewer_user_id = reviewer_user_id
@@ -32,15 +47,16 @@ class Design:
         self.reviewed_at = reviewed_at
         self.final_name = final_name
         self.metadata = metadata
-        
-        # Joined fields from stats queries
         self.product_name = product_name
         self.product_icon = product_icon
 
-    def set_reviewer_messages(self, reviewer_user_id, msg_ids):
+        if kwargs:
+            logging.warning(f"Design.__init__ received unknown kwargs: {list(kwargs.keys())}")
+
+    def set_reviewer_messages(self, reviewer_user_id: int, msg_ids: list) -> None:
         self.mockup_message_ids_reviewer[str(reviewer_user_id)] = msg_ids
 
-    def get_reviewer_messages(self, reviewer_user_id):
+    def get_reviewer_messages(self, reviewer_user_id: int) -> list:
         return self.mockup_message_ids_reviewer.get(str(reviewer_user_id), [])
 
     def all_reviewer_message_pairs(self):
@@ -52,24 +68,42 @@ class Design:
             except ValueError:
                 continue
 
-    @staticmethod
-    def _parse_row(row):
-        row['mockup_file_ids'] = json.loads(row['mockup_file_ids']) if row['mockup_file_ids'] else []
-        row['print_file_ids'] = json.loads(row['print_file_ids']) if row['print_file_ids'] else []
 
-        raw = row.get('mockup_message_ids_reviewer')
-        if raw:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                parsed = {'legacy': parsed}
-            row['mockup_message_ids_reviewer'] = parsed
-        else:
+    @staticmethod
+    def _parse_row(row: dict) -> dict:
+        """Parse JSON fields from DB row with validation."""
+        # mockup_file_ids
+        try:
+            row['mockup_file_ids'] = json.loads(row['mockup_file_ids']) if row['mockup_file_ids'] else []
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"Invalid JSON in mockup_file_ids for design {row.get('code')}: {e}")
+            row['mockup_file_ids'] = []
+
+        # print_file_ids
+        try:
+            row['print_file_ids'] = json.loads(row['print_file_ids']) if row['print_file_ids'] else []
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"Invalid JSON in print_file_ids for design {row.get('code')}: {e}")
+            row['print_file_ids'] = []
+
+        # mockup_message_ids_reviewer
+        try:
+            raw = row.get('mockup_message_ids_reviewer')
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    parsed = {'legacy': parsed}
+                row['mockup_message_ids_reviewer'] = parsed
+            else:
+                row['mockup_message_ids_reviewer'] = {}
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"Invalid JSON in mockup_message_ids_reviewer for design {row.get('code')}: {e}")
             row['mockup_message_ids_reviewer'] = {}
 
         return row
 
     @staticmethod
-    def get_by_code(code):
+    def get_by_code(code: str) -> Optional['Design']:
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
@@ -81,22 +115,22 @@ class Design:
             conn.close()
 
     @staticmethod
-    def get_pending_by_product_line(product_line_id):
+    def get_pending_by_product_line(product_line_id: int) -> list['Design']:
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
             cursor.execute("""
                 SELECT * FROM designs
-                WHERE product_line_id = %s AND status = 'pending'
+                WHERE product_line_id = %s AND status = %s
                 ORDER BY created_at DESC
-            """, (product_line_id,))
+            """, (product_line_id, DesignStatus.PENDING))
             return [Design(**Design._parse_row(r)) for r in cursor.fetchall()]
         finally:
             cursor.close()
             conn.close()
 
     @staticmethod
-    def get_all_pending():
+    def get_all_pending() -> list['Design']:
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
@@ -104,23 +138,37 @@ class Design:
                 SELECT d.*, pl.name_fa as product_name, pl.icon as product_icon
                 FROM designs d
                 JOIN product_lines pl ON d.product_line_id = pl.id
-                WHERE d.status = 'pending'
+                WHERE d.status = %s
                 ORDER BY d.created_at ASC
-            """)
+            """, (DesignStatus.PENDING,))
             return [Design(**Design._parse_row(r)) for r in cursor.fetchall()]
         finally:
             cursor.close()
             conn.close()
 
-    def save(self):
+    def save(self) -> None:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            mockup_json = json.dumps(self.mockup_file_ids, ensure_ascii=False)
-            print_json = json.dumps(self.print_file_ids, ensure_ascii=False)
-            reviewer_msgs_json = json.dumps(
-                self.mockup_message_ids_reviewer, ensure_ascii=False
-            ) if self.mockup_message_ids_reviewer else None
+            try:
+                mockup_json = json.dumps(self.mockup_file_ids, ensure_ascii=False)
+            except (TypeError, ValueError) as e:
+                logging.error(f"Failed to serialize mockup_file_ids: {e}")
+                mockup_json = '[]'
+
+            try:
+                print_json = json.dumps(self.print_file_ids, ensure_ascii=False)
+            except (TypeError, ValueError) as e:
+                logging.error(f"Failed to serialize print_file_ids: {e}")
+                print_json = '[]'
+
+            try:
+                reviewer_msgs_json = json.dumps(
+                    self.mockup_message_ids_reviewer, ensure_ascii=False
+                ) if self.mockup_message_ids_reviewer else None
+            except (TypeError, ValueError) as e:
+                logging.error(f"Failed to serialize mockup_message_ids_reviewer: {e}")
+                reviewer_msgs_json = None
 
             if self.id:
                 cursor.execute("""
@@ -135,7 +183,7 @@ class Design:
                         final_name = %s
                     WHERE id = %s
                 """, (mockup_json, print_json, reviewer_msgs_json,
-                      self.status, self.reviewer_user_id, self.reviewer_name,
+                      self.status.value, self.reviewer_user_id, self.reviewer_name,
                       self.reviewed_at, self.final_name, self.id))
             else:
                 now_utc = to_utc_naive(get_tehran_time())
@@ -144,7 +192,7 @@ class Design:
                     (code, product_line_id, status, editor_user_id, editor_name,
                      mockup_file_ids, print_file_ids, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (self.code, self.product_line_id, self.status,
+                """, (self.code, self.product_line_id, self.status.value,
                       self.editor_user_id, self.editor_name,
                       mockup_json, print_json, now_utc))
                 self.id = cursor.lastrowid
@@ -158,19 +206,19 @@ class Design:
             cursor.close()
             conn.close()
 
-    def approve(self, reviewer_user_id, reviewer_name):
+    def approve(self, reviewer_user_id: int, reviewer_name: str) -> bool:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
                 UPDATE designs
-                SET status = 'approved',
+                SET status = %s,
                     reviewer_user_id = %s,
                     reviewer_name = %s,
                     reviewed_at = %s
-                WHERE id = %s AND status = 'pending'
-            """, (reviewer_user_id, reviewer_name,
-                  to_utc_naive(get_tehran_time()), self.id))
+                WHERE id = %s AND status = %s
+            """, (DesignStatus.APPROVED, reviewer_user_id, reviewer_name,
+                  to_utc_naive(get_tehran_time()), self.id, DesignStatus.PENDING))
 
             affected = cursor.rowcount
             conn.commit()
@@ -178,7 +226,7 @@ class Design:
             if affected == 0:
                 return False
 
-            self.status = 'approved'
+            self.status = DesignStatus.APPROVED
             self.reviewer_user_id = reviewer_user_id
             self.reviewer_name = reviewer_name
             self.lock_code()
@@ -193,22 +241,21 @@ class Design:
             cursor.close()
             conn.close()
 
-    def reject(self, reviewer_user_id, reviewer_name):
+    def reject(self, reviewer_user_id: int, reviewer_name: str) -> bool:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            # Append REJ to physically free the original code, but keep log intact
             rej_code = f"{self.code}_REJ_{int(time.time())}"
             cursor.execute("""
                 UPDATE designs
-                SET status = 'rejected',
+                SET status = %s,
                     code = %s,
                     reviewer_user_id = %s,
                     reviewer_name = %s,
                     reviewed_at = %s
-                WHERE id = %s AND status = 'pending'
-            """, (rej_code, reviewer_user_id, reviewer_name,
-                  to_utc_naive(get_tehran_time()), self.id))
+                WHERE id = %s AND status = %s
+            """, (DesignStatus.REJECTED, rej_code, reviewer_user_id, reviewer_name,
+                  to_utc_naive(get_tehran_time()), self.id, DesignStatus.PENDING))
 
             affected = cursor.rowcount
             conn.commit()
@@ -216,10 +263,9 @@ class Design:
             if affected == 0:
                 return False
 
-            self.status = 'rejected'
+            self.status = DesignStatus.REJECTED
             self.reviewer_user_id = reviewer_user_id
             self.reviewer_name = reviewer_name
-            # Deliberately NOT changing self.code to keep the response smooth for the user view.
             logging.info(f"❌ Design {self.code} rejected and moved to {rej_code}")
             return True
 
@@ -231,7 +277,7 @@ class Design:
             cursor.close()
             conn.close()
 
-    def lock_code(self):
+    def lock_code(self) -> None:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -249,7 +295,7 @@ class Design:
             cursor.close()
             conn.close()
 
-    def delete(self):
+    def delete(self) -> None:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:

@@ -1,6 +1,7 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from utils.decorators import require_sudo
+from utils.enums import DesignStatus
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +153,7 @@ def _build_markup(category_key):
 
 
 @require_sudo
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the main help menu"""
     cat = HELP_CATEGORIES['main']
     await update.message.reply_text(
@@ -162,7 +163,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_sudo
-async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle navigation within the help menu"""
     query = update.callback_query
     await query.answer()
