@@ -339,3 +339,128 @@ async def handle_group_id_input(update: Update, context: ContextTypes.DEFAULT_TY
         f"Chat ID: {chat_id}"
     )
     return True
+    
+    
+@require_sudo
+async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /deletedesign <code>
+    Permanently delete a design and all its data.
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ فرمت نادرست\n"
+            "استفاده: /deletedesign <code>\n\n"
+            "مثال: /deletedesign TS001\n\n"
+            "⚠️ این عملیات غیرقابل بازگشت است!"
+        )
+        return
+    
+    code = args[0].strip().upper()
+    
+    # Confirm
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"confirm_kill_{code}"),
+            InlineKeyboardButton("❌ انصراف", callback_data="cancel_kill")
+        ]
+    ]
+    
+    from models.design import Design
+    design = Design.get_by_code(code)
+    
+    if not design:
+        await update.message.reply_text(f"❌ طرح {code} یافت نشد.")
+        return
+    
+    status_fa = {
+        DesignStatus.PENDING: "در انتظار",
+        DesignStatus.APPROVED: "تایید شده",
+        DesignStatus.REJECTED: "رد شده",
+        DesignStatus.DELETED: "حذف شده"
+    }.get(design.status, str(design.status))
+    
+    await update.message.reply_text(
+        f"⚠️ حذف کامل طرح\n\n"
+        f"کد: {code}\n"
+        f"وضعیت: {status_fa}\n"
+        f"طراح: {design.editor_name}\n\n"
+        f"این عملیات:\n"
+        f"• فایل‌ها را از گروه‌ها حذف می‌کند\n"
+        f"• پیام‌ها را از PV ناظران حذف می‌کند\n"
+        f"• کد را از دیتابیس حذف می‌کند\n\n"
+        f"⚠️ غیرقابل بازگشت است!\n\n"
+        f"ادامه می‌دهید؟",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+@require_sudo
+async def confirm_delete_design_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle design deletion confirmation"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "cancel_kill":
+        await query.edit_message_text("❌ عملیات لغو شد.")
+        return
+    
+    if data.startswith("confirm_kill_"):
+        code = data.replace("confirm_kill_", "")
+        
+        await query.edit_message_text(f"🔄 در حال حذف {code}...")
+        
+        from models.design import Design
+        result = await Design.delete_completely(code, context.bot)
+        
+        if result['database_deleted']:
+            msg = (
+                f"✅ طرح {code} به طور کامل حذف شد\n\n"
+                f"📊 گزارش:\n"
+                f"• وضعیت: {result['status']}\n"
+                f"• پیام‌های گروه حذف شده: {result['group_messages_deleted']}\n"
+                f"• پیام‌های ناظر حذف شده: {result['reviewer_messages_deleted']}\n"
+            )
+            if result['errors']:
+                msg += f"\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
+        else:
+            msg = (
+                f"❌ خطا در حذف {code}\n\n"
+                f"خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
+            )
+        
+        await query.edit_message_text(msg)
+
+@require_sudo
+async def cleanup_orphans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /cleanup
+    Delete old pending designs with no files (orphaned codes)
+    """
+    await update.message.reply_text("🔄 در حال اسکن طرح‌های ناقص...")
+    
+    from services.cleanup_service import CleanupService
+    result = await CleanupService.cleanup_orphaned_pending_designs(
+        context.bot,
+        max_age_hours=24
+    )
+    
+    msg = (
+        f"✅ پاکسازی کامل شد\n\n"
+        f"📊 گزارش:\n"
+        f"• اسکن شده: {result['scanned']}\n"
+        f"• حذف شده: {result['deleted']}\n"
+    )
+    
+    if result['codes']:
+        msg += f"\n🗑 کدهای حذف شده:\n"
+        msg += ", ".join(result['codes'][:20])
+        if len(result['codes']) > 20:
+            msg += f"\n... و {len(result['codes']) - 20} مورد دیگر"
+    
+    if result['errors']:
+        msg += f"\n\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
+    
+    await update.message.reply_text(msg)

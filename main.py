@@ -28,18 +28,19 @@ from migrations.migration_004_migrate_existing_data import Migration004
 from migrations.migration_005_add_groups_and_reviewer_dict import Migration005
 from migrations.migration_006_create_design_group_messages import Migration006
 from migrations.migration_007_add_deleted_status import Migration007
- 
- 
+
 # Handlers
 from handlers.common import start_command, cancel_command
 from handlers.sudo import (
     switch_role_command, handle_role_switch,
     manual_backup_command, restart_command, execute_restart,
     group_management_command, group_management_callback,
-    handle_group_id_input, status_command, broadcast_update_callback
+    handle_group_id_input, status_command, broadcast_update_callback,
+    delete_design_command, confirm_delete_design_callback,
+    cleanup_orphans_command
 )
 from handlers.stats import stats_command, stats_callback
-from handlers.editor import start_new_design, handle_files, editor_callbacks, handle_undo_submission
+from handlers.editor import start_new_design, handle_files, editor_callbacks
 from handlers.reviewer import review_callback
 from handlers.help import help_command, help_callback
 from handlers.management import (
@@ -48,39 +49,34 @@ from handlers.management import (
     lock_code_command, unlock_code_command, locked_codes_command
 )
 from handlers.design_management import (
-    design_info_command, delete_design_command,
+    design_info_command,
     handle_design_code_input,
     confirm_delete_callback,
     pending_designs_command,
     pending_view_callback
 )
 
-
-
-
 # Models
 from models.product_line import ProductLine
 from models.user import User
+
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Global handler for uncaught exceptions in any handler.
     Logs to console, sends to LOG_GROUP_ID, and notifies user if possible.
     """
-    # Log the full traceback
     logging.error("Uncaught exception:", exc_info=context.error)
     tb_str = ''.join(traceback.format_exception(
         type(context.error), context.error, context.error.__traceback__
     ))
 
-    # Build a safe message for Telegram (max 4096 chars)
     safe_tb = html.escape(tb_str[-3000:])
     error_msg = (
         f"⚠️ <b>Uncaught Exception</b>\n\n"
         f"<pre>{safe_tb}</pre>"
     )
 
-    # Try to send to log group
     try:
         await context.bot.send_message(
             chat_id=LOG_GROUP_ID,
@@ -90,7 +86,6 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logging.error(f"Failed to send error to log group: {e}")
 
-    # Try to notify the user something went wrong
     if isinstance(update, Update):
         user_msg = "❌ خطای داخلی رخ داد. تیم فنی در جریان قرار گرفت."
         try:
@@ -100,7 +95,6 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(user_msg)
         except Exception:
             pass
-
 
 
 # Setup Logging
@@ -126,40 +120,73 @@ def run_db_migrations():
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text.strip()
 
-    # These two take absolute priority — must be first
+    # -----------------------------------------------------------------------
+    # Priority 1 — awaiting group input
+    # -----------------------------------------------------------------------
     if context.user_data.get('awaiting_group_input'):
         handled = await handle_group_id_input(update, context)
         if handled:
             return
 
+    # -----------------------------------------------------------------------
+    # Priority 2 — awaiting design code (info / delete)
+    # -----------------------------------------------------------------------
     if context.user_data.get('awaiting_design_code'):
         handled = await handle_design_code_input(update, context)
         if handled:
             return
 
+    # -----------------------------------------------------------------------
+    # Priority 3 — privileged keyboard buttons (حذف طرح / اطلاعات طرح)
+    # ✅ Must be before product line buttons
+    # ✅ Sets awaiting_design_code then waits for next message
+    # -----------------------------------------------------------------------
+    if text == "🗑 حذف طرح":
+        if User.is_privileged_user(update.effective_user.id):
+            context.user_data['awaiting_design_code'] = 'delete'
+            await update.message.reply_text(
+                "🗑 کد طرح تایید شده‌ای که می‌خواهید حذف کنید را وارد کنید:\n"
+                "مثال: TS001\n\n"
+                "⚠️ این عملیات فایل‌ها را از گروه‌ها حذف کرده و "
+                "کد را آزاد می‌کند.\n\n"
+                "برای لغو /cancel بزنید."
+            )
+        return
 
-    if text.startswith("➕"):
+    if text == "🔍 اطلاعات طرح":
+        if User.is_privileged_user(update.effective_user.id):
+            context.user_data['awaiting_design_code'] = 'info'
+            await update.message.reply_text(
+                "🔍 کد طرح مورد نظر را وارد کنید:\n"
+                "مثال: TS001\n\n"
+                "برای لغو /cancel بزنید."
+            )
+        return
+
+    # -----------------------------------------------------------------------
+    # Priority 4 — product line submission buttons
+    # -----------------------------------------------------------------------
+    if text.startswith("➕") and "ثبت" in text:
         products = ProductLine.get_all_active()
         for pl in products:
-            if pl.name_fa in text:
+            expected_text = f"➕ {pl.icon} ثبت {pl.name_fa}"
+            if text == expected_text:
                 return await start_new_design(update, context, pl.code_prefix)
+        return
 
-    elif text == "📊 وضعیت":
-        return await status_command(update, context)
-
-    elif text == "📊 آمار کلی":
-        return await stats_command(update, context)
-        
-    elif text.startswith("📊"):
+    # -----------------------------------------------------------------------
+    # Priority 5 — product line stats buttons
+    # -----------------------------------------------------------------------
+    if text.startswith("📊 آمار") and text != "📊 آمار کلی":
         products = ProductLine.get_all_active()
         for pl in products:
-            if pl.name_fa in text:
+            expected_text = f"📊 آمار {pl.name_fa}"
+            if text == expected_text:
                 stats = pl.get_stats()
                 msg = (
-                    f"{pl.icon} آمار {pl.name_fa}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"{pl.icon} آمار {pl.name_fa}\n\n"
                     f"⏳ در انتظار: {stats[DesignStatus.PENDING]}\n"
                     f"✅ تایید شده: {stats[DesignStatus.APPROVED]}\n"
                     f"❌ رد شده: {stats[DesignStatus.REJECTED]}\n"
@@ -167,30 +194,60 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(msg)
                 return
+        return
 
-    elif text == "👑 تغییر نقش":
-        return await switch_role_command(update, context)
-    elif text == "💾 بکاپ":
-        return await manual_backup_command(update, context)
-    elif text == "🔄 ریستارت":
-        return await restart_command(update, context)
-    elif text == "⚙️ تنظیم گروه‌ها":
-        return await group_management_command(update, context)
-    elif text == "📖 راهنما":
-        return await help_command(update, context)
-    elif text == "❌ لغو":
-        return await cancel_command(update, context)
-    elif text == "🔍 اطلاعات طرح":
-        return await design_info_command(update, context)
-    elif text == "🗑 حذف طرح":
-        return await delete_design_command(update, context)
-    elif text == "📋 طرح‌های در انتظار":
+    # -----------------------------------------------------------------------
+    # Priority 6 — system buttons (exact match, all independent)
+    # -----------------------------------------------------------------------
+    if text == "📋 طرح‌های در انتظار":
         return await pending_designs_command(update, context)
+
+    if text == "📊 آمار کلی":
+        return await stats_command(update, context)
+
+    if text == "👑 تغییر نقش":
+        return await switch_role_command(update, context)
+
+    if text == "💾 بکاپ":
+        return await manual_backup_command(update, context)
+
+    if text == "🔄 ریستارت":
+        return await restart_command(update, context)
+
+    if text == "⚙️ تنظیم گروه‌ها":
+        return await group_management_command(update, context)
+
+    if text == "📊 وضعیت":
+        return await status_command(update, context)
+
+    if text == "📖 راهنما":
+        return await help_command(update, context)
+
+    # -----------------------------------------------------------------------
+    # Fallback
+    # -----------------------------------------------------------------------
+    if context.user_data.get('stage'):
+        await update.message.reply_text(
+            "📎 لطفا فایل ارسال کنید یا از دکمه‌های زیر استفاده کنید."
+        )
+    elif any(k.startswith('awaiting_') for k in context.user_data):
+        await update.message.reply_text(
+            "❌ ورودی نامعتبر. لطفا دوباره امتحان کنید یا /cancel بزنید."
+        )
+
+    # -----------------------------------------------------------------------
+    # Fallback
+    # -----------------------------------------------------------------------
     else:
-        if any(k.startswith('awaiting_') for k in context.user_data):
+        if context.user_data.get('stage'):
             await update.message.reply_text(
-                "⚠️ ورودی نامعتبر. لطفاً دوباره امتحان کنید یا /cancel بزنید."
+                "📎 لطفا فایل ارسال کنید یا از دکمه‌های زیر استفاده کنید."
             )
+        elif any(k.startswith('awaiting_') for k in context.user_data):
+            await update.message.reply_text(
+                "❌ ورودی نامعتبر. لطفا دوباره امتحان کنید یا /cancel بزنید."
+            )
+
 
 async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward the daily log message to a reviewer when sudo taps the button"""
@@ -219,6 +276,7 @@ async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Failed to forward log to {target_user_id}: {e}")
         await query.answer("❌ ارسال ناموفق", show_alert=True)
 
+
 async def send_startup_notification(context: ContextTypes.DEFAULT_TYPE):
     from config.settings import SUDO_USER_ID
     startup_time = get_tehran_time().strftime('%Y-%m-%d %H:%M:%S')
@@ -226,16 +284,19 @@ async def send_startup_notification(context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=SUDO_USER_ID,
-            text=f"✅ ربات تیسا چاپ با موفقیت راه‌اندازی شد!\n\n"
-                 f"🕐 زمان: {startup_time}\n"
-                 f"🤖 وضعیت: آماده دریافت دستورات\n\n"
-                 f"💡 می‌خوای به بقیه اطلاع بدی که ربات آپدیت شد؟",
+            text=(
+                f"✅ ربات تیسا چاپ با موفقیت راه‌اندازی شد!\n\n"
+                f"🕐 زمان: {startup_time}\n"
+                f"🤖 وضعیت: آماده دریافت دستورات\n\n"
+                f"💡 می‌خوای به بقیه اطلاع بدی که ربات آپدیت شد؟"
+            ),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📢 اطلاع به همه کاربران", callback_data="broadcast_update")
             ]])
         )
     except Exception as e:
         logging.error(f"Startup notif failed: {e}")
+
 
 class TelegramLogHandler(logging.Handler):
     """Async Queue handler for Telegram to prevent rate limits"""
@@ -245,13 +306,12 @@ class TelegramLogHandler(logging.Handler):
         self.chat_id = chat_id
         self.message_queue = []
         self.is_sending = False
-        self._recursion_guard = False  # FIX: Add recursion protection
+        self._recursion_guard = False
 
     def emit(self, record):
-        # FIX: Prevent recursion
         if self._recursion_guard:
             return
-            
+
         if record.levelno >= logging.INFO:
             try:
                 self._recursion_guard = True
@@ -270,10 +330,8 @@ class TelegramLogHandler(logging.Handler):
         if self.is_sending:
             return
         self.is_sending = True
-        
-        # FIX: Add recursion guard during sending too
         self._recursion_guard = True
-        
+
         try:
             while self.message_queue:
                 msg = self.message_queue.pop(0)
@@ -286,11 +344,11 @@ class TelegramLogHandler(logging.Handler):
                     )
                     await asyncio.sleep(0.3)
                 except Exception:
-                    # FIX: Don't log the error (would cause recursion)
                     pass
         finally:
             self.is_sending = False
             self._recursion_guard = False
+
 
 if __name__ == "__main__":
     logging.info("🚀 Starting Tisa Print Bot...")
@@ -308,26 +366,31 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # Commands
     # -----------------------------------------------------------------------
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("start",         start_command))
+    application.add_handler(CommandHandler("cancel",        cancel_command))
+    application.add_handler(CommandHandler("help",          help_command))
 
     # User management
-    application.add_handler(CommandHandler("adduser", add_user_command))
-    application.add_handler(CommandHandler("removeuser", remove_user_command))
-    application.add_handler(CommandHandler("listusers", list_users_command))
-    application.add_handler(CommandHandler("setrole", set_role_command))
+    application.add_handler(CommandHandler("adduser",       add_user_command))
+    application.add_handler(CommandHandler("removeuser",    remove_user_command))
+    application.add_handler(CommandHandler("listusers",     list_users_command))
+    application.add_handler(CommandHandler("setrole",       set_role_command))
 
     # Product line management
-    application.add_handler(CommandHandler("listlines", list_lines_command))
-    application.add_handler(CommandHandler("addline", add_line_command))
-    application.add_handler(CommandHandler("disableline", disable_line_command))
-    application.add_handler(CommandHandler("enableline", enable_line_command))
+    application.add_handler(CommandHandler("listlines",     list_lines_command))
+    application.add_handler(CommandHandler("addline",       add_line_command))
+    application.add_handler(CommandHandler("disableline",   disable_line_command))
+    application.add_handler(CommandHandler("enableline",    enable_line_command))
 
     # Code management
-    application.add_handler(CommandHandler("lockcode", lock_code_command))
-    application.add_handler(CommandHandler("unlockcode", unlock_code_command))
-    application.add_handler(CommandHandler("lockedcodes", locked_codes_command))
+    application.add_handler(CommandHandler("lockcode",      lock_code_command))
+    application.add_handler(CommandHandler("unlockcode",    unlock_code_command))
+    application.add_handler(CommandHandler("lockedcodes",   locked_codes_command))
+
+    # Design management
+    application.add_handler(CommandHandler("designinfo",    design_info_command))
+    application.add_handler(CommandHandler("deletedesign",  delete_design_command))
+    application.add_handler(CommandHandler("cleanup",       cleanup_orphans_command))
 
     # -----------------------------------------------------------------------
     # Text routing & Files
@@ -335,7 +398,6 @@ if __name__ == "__main__":
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)
     )
-
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.ALL),
@@ -346,46 +408,93 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # Callbacks
     # -----------------------------------------------------------------------
-    application.add_handler(CallbackQueryHandler(handle_role_switch, pattern=r"^role_"))
+
+    # Role switching
+    application.add_handler(CallbackQueryHandler(
+        handle_role_switch,
+        pattern=r"^role_"
+    ))
+
+    # Editor stage flow
     application.add_handler(CallbackQueryHandler(
         editor_callbacks,
-        pattern=r"^(add_mockup|add_print|back_to_menu|cancel_submission|confirm_submit)$"
+        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|workspace_clear_mockup|workspace_clear_print|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission)$"
     ))
-    application.add_handler(CallbackQueryHandler(handle_undo_submission, pattern=r"^undo_"))
-    application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^(approve|reject)_"))
+
+    # Reviewer
     application.add_handler(CallbackQueryHandler(
-        execute_restart, pattern=r"^(confirm_restart|cancel_restart)$"
+        review_callback,
+        pattern=r"^(approve|reject)_"
     ))
+
+    # Restart
     application.add_handler(CallbackQueryHandler(
-        group_management_callback, pattern=r"^setgroup_"
+        execute_restart,
+        pattern=r"^(confirm_restart|cancel_restart)$"
     ))
+
+    # Group management
     application.add_handler(CallbackQueryHandler(
-        sendlog_callback, pattern=r"^sendlog_"
+        group_management_callback,
+        pattern=r"^setgroup_"
     ))
+
+    # Log forwarding
     application.add_handler(CallbackQueryHandler(
-        help_callback, pattern=r"^help_"
+        sendlog_callback,
+        pattern=r"^sendlog_"
     ))
+
+    # Help
     application.add_handler(CallbackQueryHandler(
-        stats_callback, pattern=r"^stats_"
+        help_callback,
+        pattern=r"^help_"
     ))
+
+    # Stats
     application.add_handler(CallbackQueryHandler(
-        broadcast_update_callback, pattern=r"^broadcast_update$"
+        stats_callback,
+        pattern=r"^stats_"
     ))
+
+    # Broadcast
+    application.add_handler(CallbackQueryHandler(
+        broadcast_update_callback,
+        pattern=r"^broadcast_update$"
+    ))
+
+    # Delete design confirmation (from sudo.py)
+    application.add_handler(CallbackQueryHandler(
+        confirm_delete_design_callback,
+        pattern=r"^(confirm_kill_.+|cancel_kill)$"
+    ))
+
+    # Design management callbacks (from design_management.py)
     application.add_handler(CallbackQueryHandler(
         confirm_delete_callback,
         pattern=r"^(confirm_delete_.+|cancel_delete)$"
     ))
+
     application.add_handler(CallbackQueryHandler(
         pending_view_callback,
         pattern=r"^pending_view_"
     ))
+
     # -----------------------------------------------------------------------
     # Jobs
     # -----------------------------------------------------------------------
     application.job_queue.run_once(send_startup_notification, 2)
-    
-    t = time(hour=BACKUP_TIME_HOUR, minute=BACKUP_TIME_MINUTE, tzinfo=TEHRAN_TZ)
-    application.job_queue.run_daily(send_daily_backup, time=t, name='daily_backup')
+
+    t = time(
+        hour=BACKUP_TIME_HOUR,
+        minute=BACKUP_TIME_MINUTE,
+        tzinfo=TEHRAN_TZ
+    )
+    application.job_queue.run_daily(
+        send_daily_backup,
+        time=t,
+        name='daily_backup'
+    )
 
     logging.info("✅ Bot is ready and polling...")
     application.run_polling()

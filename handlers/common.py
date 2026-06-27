@@ -31,7 +31,27 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel current operation"""
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cancel current operation and clean all state."""
+    from handlers.editor import _clear_editor_state
+    from models.design import Design
+
+    # If editor session is active, delete the pending design
+    code = context.user_data.get('code')
+    if code:
+        design = Design.get_by_code(code)
+        if design:
+            try:
+                design.delete()
+            except Exception as e:
+                logging.warning(f"Could not delete design {code} on cancel: {e}")
+
+    _clear_editor_state(context)
     context.user_data.clear()
-    await update.message.reply_text("✅ عملیات لغو شد. به منوی اصلی بازگشتید.")
+
+    await update.message.reply_text(
+        "❌ عملیات لغو شد. به منوی اصلی بازگشتید."
+    )

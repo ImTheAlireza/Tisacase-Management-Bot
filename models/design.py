@@ -59,6 +59,52 @@ class Design:
     def get_reviewer_messages(self, reviewer_user_id: int) -> list:
         return self.mockup_message_ids_reviewer.get(str(reviewer_user_id), [])
 
+    def save_reviewer_messages(self) -> None:
+        """
+        ✅ SAFE — Targeted update of mockup_message_ids_reviewer only.
+
+        Called after sending mockup files to a reviewer's PV.
+        Stores the message IDs so they can be deleted later
+        when the design is approved/rejected/deleted.
+
+        IMPORTANT:
+        - Only updates mockup_message_ids_reviewer column.
+        - Never touches file IDs, status, or any other field.
+        - Preserves existing reviewer entries (other reviewers not affected).
+        """
+        if not self.id:
+            logging.error(
+                f"save_reviewer_messages: design {self.code} has no id"
+            )
+            return
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            reviewer_json = json.dumps(
+                self.mockup_message_ids_reviewer,
+                ensure_ascii=False
+            )
+            cursor.execute("""
+                UPDATE designs
+                SET mockup_message_ids_reviewer = %s
+                WHERE id = %s
+            """, (reviewer_json, self.id))
+            conn.commit()
+            logging.info(
+                f"✅ Reviewer messages saved for design {self.code}: "
+                f"{self.mockup_message_ids_reviewer}"
+            )
+        except Exception as e:
+            conn.rollback()
+            logging.error(
+                f"Failed to save reviewer messages for {self.code}: {e}"
+            )
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
     def all_reviewer_message_pairs(self):
         for key, msg_ids in self.mockup_message_ids_reviewer.items():
             if key == 'legacy':
@@ -296,12 +342,19 @@ class Design:
             conn.close()
 
     def delete(self) -> None:
+        """
+        ✅ SAFE — Pure DB row deletion only.
+        - Does NOT delete Telegram messages.
+        - Does NOT delete design_group_messages records.
+        - Does NOT clear reviewer message IDs.
+        - Caller is responsible for Telegram cleanup before calling this.
+        """
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("DELETE FROM designs WHERE id = %s", (self.id,))
             conn.commit()
-            logging.info(f"🗑️ Design {self.code} deleted")
+            logging.info(f"🗑️ Design row {self.code} (id={self.id}) deleted from database")
         except Exception as e:
             conn.rollback()
             logging.error(f"Failed to delete design {self.code}: {e}")
@@ -309,3 +362,153 @@ class Design:
         finally:
             cursor.close()
             conn.close()
+            
+          
+    @staticmethod
+    async def delete_completely(code: str, bot) -> dict:
+        """
+        ✅ SAFE FULL DELETION — The ONLY method that deletes a design completely.
+
+        Order of operations:
+        1. Delete Telegram messages from groups (APPROVED only)
+        2. Delete design_group_messages records (APPROVED only)
+        3. Delete Telegram messages from reviewer PVs (PENDING only)
+           NOTE: Does NOT clear mockup_message_ids_reviewer in DB — history preserved.
+        4. Free locked code from designs_locked_codes
+        5. Delete the design row from designs table
+
+        Returns:
+            {
+                'code': str,
+                'status': str,
+                'group_messages_deleted': int,
+                'reviewer_messages_deleted': int,
+                'database_deleted': bool,
+                'errors': list[str]
+            }
+        """
+        from models.design_group_message import DesignGroupMessage
+
+        result = {
+            'code': code,
+            'status': 'not_found',
+            'group_messages_deleted': 0,
+            'reviewer_messages_deleted': 0,
+            'database_deleted': False,
+            'errors': []
+        }
+
+        design = Design.get_by_code(code)
+        if not design:
+            result['errors'].append(f"Design {code} not found")
+            logging.warning(f"delete_completely: design {code} not found")
+            return result
+
+        result['status'] = design.status.value
+
+        # --------------------------------------------------
+        # 1️⃣ Delete group messages from Telegram (APPROVED)
+        # ✅ Only approved designs have files in groups
+        # --------------------------------------------------
+        if design.status == DesignStatus.APPROVED:
+            group_msgs = DesignGroupMessage.get_by_code(code)
+
+            for record in group_msgs:
+                try:
+                    await bot.delete_message(
+                        chat_id=record['chat_id'],
+                        message_id=record['message_id']
+                    )
+                    result['group_messages_deleted'] += 1
+                except Exception as e:
+                    logging.warning(
+                        f"Could not delete group msg {record['message_id']} "
+                        f"in chat {record['chat_id']}: {e}"
+                    )
+                    # ✅ Non-fatal — message may already be deleted
+                    result['errors'].append(
+                        f"Group msg {record['message_id']}: {e}"
+                    )
+
+            # --------------------------------------------------
+            # 2️⃣ Delete design_group_messages records from DB
+            # ✅ Only AFTER Telegram deletion attempt
+            # ✅ This is correct — group records are no longer
+            #    needed once design is deleted
+            # --------------------------------------------------
+            try:
+                DesignGroupMessage.delete_by_code(code)
+                logging.info(
+                    f"✅ Deleted {len(group_msgs)} group message records for {code}"
+                )
+            except Exception as e:
+                result['errors'].append(f"Failed to delete group records: {e}")
+                logging.error(f"Could not delete group message records for {code}: {e}")
+
+        # --------------------------------------------------
+        # 3️⃣ Delete reviewer PV messages from Telegram (PENDING)
+        # ✅ Only pending designs have messages in reviewer PVs
+        # ✅ IMPORTANT: We delete Telegram messages only.
+        #    We do NOT modify mockup_message_ids_reviewer in DB.
+        #    This preserves the audit trail of who reviewed what.
+        # --------------------------------------------------
+        if design.status == DesignStatus.PENDING:
+            for reviewer_id, msg_ids in design.all_reviewer_message_pairs():
+                for msg_id in msg_ids:
+                    try:
+                        await bot.delete_message(
+                            chat_id=reviewer_id,
+                            message_id=msg_id
+                        )
+                        result['reviewer_messages_deleted'] += 1
+                    except Exception as e:
+                        logging.warning(
+                            f"Could not delete reviewer msg {msg_id} "
+                            f"from {reviewer_id}: {e}"
+                        )
+                        result['errors'].append(
+                            f"Reviewer msg {msg_id}: {e}"
+                        )
+
+        # --------------------------------------------------
+        # 4️⃣ Free locked code
+        # ✅ Always do this regardless of status
+        # ✅ Allows code to be reused
+        # --------------------------------------------------
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "DELETE FROM designs_locked_codes WHERE code = %s",
+                    (code,)
+                )
+                conn.commit()
+                logging.info(f"🔓 Code {code} freed from designs_locked_codes")
+            finally:
+                cursor.close()
+                conn.close()
+        except Exception as e:
+            result['errors'].append(f"Failed to free locked code: {e}")
+            logging.error(f"Could not free locked code {code}: {e}")
+
+        # --------------------------------------------------
+        # 5️⃣ Delete design row from database
+        # ✅ Always last step
+        # ✅ design.delete() is a pure DB row deletion
+        # --------------------------------------------------
+        try:
+            design.delete()
+            result['database_deleted'] = True
+            logging.info(
+                f"✅ Design {code} fully deleted. "
+                f"Group msgs: {result['group_messages_deleted']}, "
+                f"Reviewer msgs: {result['reviewer_messages_deleted']}"
+            )
+        except Exception as e:
+            result['errors'].append(f"Database deletion failed: {e}")
+            logging.error(f"Database deletion failed for {code}: {e}")
+
+        return result
+        
+        

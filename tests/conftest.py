@@ -67,7 +67,7 @@ def _create_test_schema(cursor) -> None:
             code_prefix VARCHAR(10) UNIQUE NOT NULL,
             name_en VARCHAR(50) NOT NULL,
             name_fa VARCHAR(50) NOT NULL,
-            icon VARCHAR(10) DEFAULT '📦',
+            icon VARCHAR(10) DEFAULT '',
             code_format VARCHAR(50) DEFAULT '{prefix}{counter:03d}',
             counter_start INT DEFAULT 1,
             counter_end INT DEFAULT 999,
@@ -114,11 +114,38 @@ def _create_test_schema(cursor) -> None:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """)
 
+    # ← THIS WAS MISSING
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS design_group_messages (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            design_id INT NOT NULL,
+            code VARCHAR(20) NOT NULL,
+            group_type ENUM('products', 'print') NOT NULL,
+            chat_id BIGINT NOT NULL,
+            message_id BIGINT NOT NULL,
+            file_id VARCHAR(255) NOT NULL,
+            file_index INT NOT NULL DEFAULT 0,
+            sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_msg (chat_id, message_id),
+            INDEX idx_design_id (design_id),
+            INDEX idx_code (code),
+            INDEX idx_group_type (group_type),
+            INDEX idx_chat_message (chat_id, message_id),
+            INDEX idx_sent_at (sent_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
 
 def _drop_test_schema(cursor) -> None:
     """Drop all test tables."""
     cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
-    for table in ['designs_locked_codes', 'designs', 'product_lines', 'users']:
+    for table in [
+        'design_group_messages',  # ← ADD THIS — drop before designs (foreign key)
+        'designs_locked_codes',
+        'designs',
+        'product_lines',
+        'users'
+    ]:
         cursor.execute(f"DROP TABLE IF EXISTS {table}")
     cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
 

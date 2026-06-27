@@ -296,6 +296,7 @@ def _delete_key(update, context) -> str:
     data: str = update.callback_query.data
     if data == "cancel_delete":
         return "cancel_delete"
+    # callback_data format: confirm_delete_{code}
     code: str = data.split('_', 2)[2]
     return f"delete_{code}"
 
@@ -306,8 +307,10 @@ async def confirm_delete_callback(
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Handle confirm/cancel delete buttons.
-    Protected with deduplication to prevent race conditions.
+    ✅ SAFE — Handle confirm/cancel delete buttons.
+    - Uses Design.delete_completely() as single source of truth.
+    - No duplicate deletion logic.
+    - Deduplication prevents race conditions.
     """
     query = update.callback_query
     await query.answer()
@@ -323,103 +326,56 @@ async def confirm_delete_callback(
         await safe_edit_message(query, "👌 عملیات حذف لغو شد.")
         return
 
-    # Extract code from callback data: confirm_delete_{code}
+    # Extract code — callback_data format: confirm_delete_{code}
     code: str = query.data.split('_', 2)[2]
-    design: Optional[Design] = Design.get_by_code(code)
 
+    design: Optional[Design] = Design.get_by_code(code)
     if not design:
         await safe_edit_message(query, "❌ طرح یافت نشد.")
         return
 
     if design.status != DesignStatus.APPROVED:
-        await safe_edit_message(query, "❌ فقط طرح‌های تایید شده قابل حذف هستند.")
+        await safe_edit_message(
+            query,
+            "❌ فقط طرح‌های تایید شده قابل حذف هستند."
+        )
         return
 
     await safe_edit_message(query, f"⏳ در حال حذف طرح {code} از گروه‌ها...")
 
-    # Delete messages from groups
-    group_msgs: list = DesignGroupMessage.get_by_code(code)
-    deleted_from_groups: int = 0
-    failed_deletions: int = 0
+    # ✅ Single centralized deletion — handles everything
+    result = await Design.delete_completely(code, context.bot)
 
-    for record in group_msgs:
-        try:
-            await context.bot.delete_message(
-                chat_id=record['chat_id'],
-                message_id=record['message_id']
+    if not result['database_deleted']:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=(
+                f"❌ خطا در حذف طرح {code}.\n"
+                f"لطفاً با Sudo تماس بگیرید."
             )
-            deleted_from_groups += 1
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logging.warning(f"Could not delete msg {record['message_id']} from group: {e}")
-            failed_deletions += 1
+        )
+        return
 
-    # Remove group message records
-    if group_msgs:
-        DesignGroupMessage.delete_by_code(code)
-
-    # Remove from locked_codes to free the code
-    _free_locked_code(code)
-
-    # Rename the design record to free the original code
-    _rename_design_as_deleted(design, code)
-
+    # ✅ Build result message
     result_lines = [
         f"✅ طرح {code} با موفقیت حذف شد.",
         "━━━━━━━━━━━━━━━━━━",
-        f"🗑 پیام‌های حذف شده از گروه: {deleted_from_groups}",
+        f"🗑 پیام‌های حذف شده از گروه‌ها: {result['group_messages_deleted']}",
+        f"🔓 کد {code} آزاد شد و قابل استفاده مجدد است.",
     ]
-    if failed_deletions:
-        result_lines.append(f"⚠️ پیام‌هایی که قابل حذف نبودند: {failed_deletions}")
-    result_lines.append(f"🔓 کد {code} آزاد شد و قابل استفاده مجدد است.")
+
+    # Show non-fatal errors if any (e.g. messages already deleted)
+    if result['errors']:
+        result_lines.append(
+            f"\n⚠️ {len(result['errors'])} پیام قابل حذف نبودند "
+            f"(احتمالاً قبلاً حذف شده‌اند)."
+        )
 
     await context.bot.send_message(
         chat_id=query.from_user.id,
         text='\n'.join(result_lines)
     )
 
-
-def _free_locked_code(code: str) -> None:
-    """Remove code from designs_locked_codes table"""
-    from config.database import get_db_connection
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "DELETE FROM designs_locked_codes WHERE code = %s", (code,)
-        )
-        conn.commit()
-        logging.info(f"🔓 Code {code} removed from locked_codes")
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Failed to free locked code {code}: {e}")
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def _rename_design_as_deleted(design: Design, original_code: str) -> None:
-    """
-    Rename the design code to {CODE}_DEL_{timestamp} to free the original code slot.
-    Same pattern as rejection (_REJ_).
-    """
-    from config.database import get_db_connection
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        del_code: str = f"{original_code}_DEL_{int(time.time())}"
-        cursor.execute(
-            "UPDATE designs SET code = %s, status = %s WHERE id = %s",
-            (del_code, DesignStatus.DELETED.value, design.id)
-        )
-        conn.commit()
-        logging.info(f"🗑 Design {original_code} renamed to {del_code}")
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Failed to rename design {original_code}: {e}")
-    finally:
-        cursor.close()
-        conn.close()
 
 
 # ===========================================================================
@@ -491,10 +447,10 @@ async def pending_designs_command(update: Update, context: ContextTypes.DEFAULT_
 async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Send mockup + print files when a code button is tapped in pending list.
-    Improved with:
-    - File count warning for large designs
-    - Better file sending with fallback
-    - Completion message
+
+    ✅ FIXED: Mockup message IDs are now stored in DB per reviewer.
+    This allows cleanup of reviewer PV messages after approve/reject.
+    Print file message IDs are NOT stored — only mockups need cleanup.
     """
     query = update.callback_query
     await query.answer()
@@ -544,39 +500,121 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"📋 {pl_name} | کد: {code}\n"
             f"👤 طراح: {design.editor_name or 'نامشخص'}\n"
             f"📅 ثبت: {format_datetime_persian(design.created_at)}\n"
-            f"🖼 موکاپ: {len(design.mockup_file_ids)} | 🖨 چاپی: {len(design.print_file_ids)}\n\n"
+            f"🖼 موکاپ: {len(design.mockup_file_ids)} | "
+            f"🖨 چاپی: {len(design.print_file_ids)}\n\n"
             f"⏳ در حال ارسال فایل‌ها..."
         )
     )
 
-    # Helper: safe file sending with fallback
-    async def send_file_safe(chat_id: int, file_id: str, caption: str) -> None:
-        """Try to send as photo first, fallback to document"""
-        try:
-            await context.bot.send_photo(chat_id, photo=file_id, caption=caption)
-        except Exception:
-            try:
-                await context.bot.send_document(chat_id, document=file_id, caption=caption)
-            except Exception as e:
-                logging.error(f"Failed to send file to {chat_id}: {e}")
-
-    # Send mockups
+    # ===========================================================
+    # ✅ Send mockups — collect message IDs for later cleanup
+    # ===========================================================
     mockup_count: int = len(design.mockup_file_ids)
+    sent_mockup_msg_ids: list[int] = []
+
     for i, fid in enumerate(design.mockup_file_ids):
         cap: str = f"🖼 موکاپ {i+1}/{mockup_count} — {code}"
-        await send_file_safe(user_id, fid, cap)
-        await asyncio.sleep(0.3)  # Rate limiting
+        msg = None
+        try:
+            msg = await context.bot.send_photo(
+                chat_id=user_id,
+                photo=fid,
+                caption=cap
+            )
+        except Exception:
+            try:
+                msg = await context.bot.send_document(
+                    chat_id=user_id,
+                    document=fid,
+                    caption=cap
+                )
+            except Exception as e:
+                logging.error(
+                    f"Failed to send mockup {i+1} of {code} "
+                    f"to reviewer {user_id}: {e}"
+                )
 
+        # ✅ Collect message ID if send succeeded
+        if msg:
+            sent_mockup_msg_ids.append(msg.message_id)
+
+        await asyncio.sleep(0.3)
+
+    # ===========================================================
+    # ✅ Save mockup message IDs to DB
+    # So _delete_my_messages() can clean up after review decision
+    # ✅ This ADDS to existing reviewer entries (does not overwrite others)
+    # ✅ If reviewer views the design again, IDs are refreshed
+    # ===========================================================
+    if sent_mockup_msg_ids:
+        design.set_reviewer_messages(user_id, sent_mockup_msg_ids)
+        try:
+            design.save_reviewer_messages()
+        except Exception as e:
+            logging.error(
+                f"Could not save reviewer message IDs for {code}: {e}"
+            )
+
+    # ===========================================================
+    # Send approve / reject buttons
+    # ✅ Buttons sent AFTER files so reviewer sees files first
+    # ===========================================================
+    review_markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ تایید",
+                callback_data=f"approve_{code}"
+            ),
+            InlineKeyboardButton(
+                "❌ رد",
+                callback_data=f"reject_{code}"
+            ),
+        ]
+    ])
+
+    btn_msg = await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"🔖 کد: {code}\n"
+            f"👤 طراح: {design.editor_name}\n\n"
+            f"تصمیم خود را انتخاب کنید:"
+        ),
+        reply_markup=review_markup
+    )
+
+    # ✅ Also track the button message ID so it gets cleaned up too
+    if btn_msg:
+        existing = design.get_reviewer_messages(user_id)
+        updated = existing + [btn_msg.message_id]
+        design.set_reviewer_messages(user_id, updated)
+        try:
+            design.save_reviewer_messages()
+        except Exception as e:
+            logging.error(
+                f"Could not save button message ID for {code}: {e}"
+            )
+
+    # ===========================================================
     # Send print files
+    # ✅ Print file IDs are NOT tracked — no cleanup needed
+    # ===========================================================
     unique_prints: list = list(dict.fromkeys(design.print_file_ids))
     print_count: int = len(unique_prints)
+
     for i, fid in enumerate(unique_prints):
         cap: str = f"🖨 فایل چاپی {i+1}/{print_count} — {code}"
         try:
-            await context.bot.send_document(user_id, document=fid, caption=cap)
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=fid,
+                caption=cap
+            )
             await asyncio.sleep(0.3)
         except Exception as e:
-            logging.error(f"Failed to send print {i} to {user_id}: {e}")
+            logging.error(
+                f"Failed to send print {i+1} of {code} "
+                f"to reviewer {user_id}: {e}"
+            )
 
     # Completion message
     await context.bot.send_message(
