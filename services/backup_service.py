@@ -3,15 +3,15 @@ import zipfile
 import tempfile
 import os
 import json
+import csv
 import shutil
 import pymysql
 import logging
-import asyncio  # ADD THIS
+import asyncio
 from datetime import datetime
 from config.database import get_db_connection
 from config.settings import DB_CONFIG
 from utils.helpers import get_tehran_time
-from utils.enums import DesignStatus
 
 class BackupService:
 
@@ -119,6 +119,96 @@ class BackupService:
             return json.dumps(codes_data, ensure_ascii=False, indent=2, default=json_serial)
         except Exception as e:
             logging.error(f"Codes export failed: {e}")
+            return None
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def create_csv_export(time_range: str = 'all') -> str:
+        """Export design data as CSV with Persian column headers.
+
+        Args:
+            time_range: 'week', 'month', or 'all'
+
+        Returns:
+            Path to generated CSV file, or None on failure
+        """
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            where_clause = ""
+            if time_range == 'week':
+                where_clause = "WHERE d.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)"
+            elif time_range == 'month':
+                where_clause = "WHERE d.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 MONTH)"
+
+            query = f"""
+                SELECT
+                    d.code,
+                    pl.name_fa AS product_line,
+                    pl.icon AS product_icon,
+                    CASE d.status
+                        WHEN 'pending' THEN 'در انتظار'
+                        WHEN 'approved' THEN 'تایید شده'
+                        WHEN 'rejected' THEN 'رد شده'
+                        WHEN 'deleted' THEN 'حذف شده'
+                        ELSE d.status
+                    END AS status_fa,
+                    d.editor_name,
+                    d.reviewer_name,
+                    d.created_at,
+                    d.reviewed_at,
+                    d.final_name
+                FROM designs d
+                JOIN product_lines pl ON d.product_line_id = pl.id
+                {where_clause}
+                ORDER BY d.created_at DESC
+            """
+
+            cursor.execute(query)
+            rows = cursor.fetchall()
+
+            if not rows:
+                logging.warning("CSV export: no data found for time_range=%s", time_range)
+                return None
+
+            now_tehran = get_tehran_time()
+            timestamp = now_tehran.strftime('%Y%m%d_%H%M')
+            temp_dir = tempfile.mkdtemp()
+            csv_filename = f"tisa_export_{time_range}_{timestamp}.csv"
+            csv_path = os.path.join(temp_dir, csv_filename)
+
+            headers = [
+                'کد', 'خط تولید', 'آیکون', 'وضعیت',
+                'طراح', 'ناظر', 'تاریخ ثبت', 'تاریخ بررسی', 'نام نهایی'
+            ]
+
+            with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+
+                for row in rows:
+                    created = row['created_at'].strftime('%Y-%m-%d %H:%M') if row['created_at'] else ''
+                    reviewed = row['reviewed_at'].strftime('%Y-%m-%d %H:%M') if row['reviewed_at'] else ''
+
+                    writer.writerow([
+                        row['code'],
+                        row['product_line'],
+                        row['product_icon'],
+                        row['status_fa'],
+                        row['editor_name'] or '',
+                        row['reviewer_name'] or '',
+                        created,
+                        reviewed,
+                        row['final_name'] or ''
+                    ])
+
+            logging.info(f"CSV export created: {csv_filename} ({len(rows)} rows)")
+            return csv_path
+
+        except Exception as e:
+            logging.error(f"CSV export failed: {e}")
             return None
         finally:
             cursor.close()
@@ -260,19 +350,75 @@ class BackupService:
 async def send_daily_backup(context):
     from config.settings import SUDO_USER_ID
     from models.user import User
+    from services.stats_service import StatsService
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
     zip_path = await BackupService.create_daily_backup_zip()
-    stats = BackupService.get_stats_summary()
+    summary = StatsService.get_daily_summary()
 
-    lines = ["📋 لاگ روزانه\n━━━━━━━━━━━━━━━━━━"]
-    for prefix, data in stats.get('product_lines', {}).items():
-        lines.append(
-            f"\n{data['name']} ({prefix})\n"
-            f"  ⏳ در انتظار: {data[DesignStatus.PENDING]}\n"
-            f"  ✅ تایید: {data[DesignStatus.APPROVED]}\n"
-            f"  ❌ رد: {data[DesignStatus.REJECTED]}"
-        )
+    # ── Build the daily log ──────────────────────────────────────────
+    lines = [
+        f"📊 گزارش روزانه — {summary['date']} {summary['weekday']}",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    # Today's activity per product line
+    has_today_activity = any(
+        (r['submitted_today'] or 0) + (r['approved_today'] or 0) + (r['rejected_today'] or 0) > 0
+        for r in summary['today_lines']
+    )
+
+    if has_today_activity:
+        lines.append("\n📦 فعالیت امروز:")
+        for r in summary['today_lines']:
+            s = r['submitted_today'] or 0
+            a = r['approved_today'] or 0
+            rj = r['rejected_today'] or 0
+            if s + a + rj == 0:
+                continue
+            parts = []
+            if s: parts.append(f"ثبت {s}")
+            if a: parts.append(f"تایید {a}")
+            if rj: parts.append(f"رد {rj}")
+            lines.append(f"  {r['icon']} {r['name_fa']}: {' | '.join(parts)}")
+    else:
+        lines.append("\n📦 فعالیت امروز: —")
+
+    # Pending queue
+    pending = summary['pending_codes']
+    if pending:
+        lines.append(f"\n⏳ در انتظار بررسی ({len(pending)}):")
+        codes = [p['code'] for p in pending[:10]]
+        lines.append(f"  {', '.join(codes)}")
+        if len(pending) > 10:
+            lines.append(f"  ... و {len(pending) - 10} مورد دیگر")
+    else:
+        lines.append("\n⏳ در انتظار بررسی: —")
+
+    # Top performers today
+    lines.append("\n👤 برترین‌ها امروز:")
+    editor = summary['top_editor_today']
+    reviewer = summary['top_reviewer_today']
+    if editor:
+        lines.append(f"  🎨 طراح: {editor['editor_name']} ({editor['count']} ثبت)")
+    else:
+        lines.append(f"  🎨 طراح: —")
+    if reviewer:
+        lines.append(f"  ✅ ناظر: {reviewer['reviewer_name']} ({reviewer['count']} بررسی)")
+    else:
+        lines.append(f"  ✅ ناظر: —")
+
+    # Weekly trend
+    w = summary['weekly']
+    ws = w['submitted_week'] or 0
+    wa = w['approved_week'] or 0
+    wr = w['rejected_week'] or 0
+    lines.append(f"\n📈 هفتگی: ثبت {ws} | تایید {wa} | رد {wr}")
+
+    # System totals
+    sys = summary['system']
+    lines.append(f"🗄 کل: {sys['total'] or 0} طرح | {sys['pending'] or 0} در انتظار | {sys['approved'] or 0} تایید شده")
+
     log_text = '\n'.join(lines)
 
     reviewers = User.get_by_role('reviewer')

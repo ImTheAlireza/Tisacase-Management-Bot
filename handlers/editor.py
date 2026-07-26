@@ -1,6 +1,10 @@
 import logging
 import asyncio
-from typing import Optional
+import os
+import shutil
+import tempfile
+import zipfile
+from typing import Optional, Tuple
 from telegram import (
     Update,
     InputMediaPhoto,
@@ -10,8 +14,11 @@ from telegram import (
 )
 from telegram.ext import ContextTypes
 
+from config.settings import TELEGRAM_SEND_DELAY
+
 
 from utils.decorators import require_role
+from utils.state_manager import StateManager
 from utils.enums import DesignStatus, EditorStage
 from utils.helpers import safe_edit_message, delete_messages
 from utils.callback_lock import deduplicate_callback
@@ -76,6 +83,7 @@ async def _handle_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
             design = Design.get_by_code(code)
             if design and design.status == DesignStatus.PENDING:
                 await Design.delete_completely(code, context.bot)
+                logging.info(f"Timeout: Design {code} deleted due to inactivity")
         except Exception as e:
             logging.error(f"Timeout cleanup failed for {code}: {e}")
 
@@ -102,9 +110,9 @@ async def _handle_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logging.warning(f"Could not send timeout notice to {chat_id}: {e}")
 
-    # ✅ 4. Clear memory state
+    # ✅ 4. Clear memory state — only editor keys, preserve other user state
     if chat_id in app.user_data:
-        app.user_data[chat_id].clear()
+        StateManager.clear_editor_state(app.user_data[chat_id])
 
 # ---------------------------------------------------------------------------
 # State Helpers
@@ -129,11 +137,7 @@ def _clear_editor_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     NOTE: Does NOT delete the design from database - caller must handle that.
     """
     _cancel_inactivity_job(context)
-    for key in [
-        'code', 'product_id', 'product_name', 'stage',
-        'mockup_files', 'print_files', 'workspace_message_id',
-    ]:
-        context.user_data.pop(key, None)
+    StateManager.clear_editor_state(context)
 
 # ---------------------------------------------------------------------------
 # Workspace Renderer
@@ -202,7 +206,76 @@ async def _render_stage(
 # Entry Point — Start New Design
 # ---------------------------------------------------------------------------
 
-@require_role('editor', 'sudo')
+async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, design: Design) -> None:
+    """
+    Load an existing pending design into editor workflow for editing.
+
+    Args:
+        update: Telegram update (from callback query)
+        context: Bot context
+        design: Design object to edit
+    """
+    user_id = update.callback_query.from_user.id
+
+    # Verify design can be edited
+    if not design.can_be_edited_by(user_id):
+        await update.callback_query.answer(
+            "⚠️ فقط طرح‌های در انتظار را می‌توان ویرایش کرد",
+            show_alert=True
+        )
+        return
+
+    # Cleanup any existing session
+    _clear_editor_state(context)
+
+    # Load design into context
+    product_line = ProductLine.get_by_id(design.product_line_id)
+
+    context.user_data['code'] = design.code
+    context.user_data['product_id'] = product_line.id
+    context.user_data['product_name'] = product_line.name_fa
+    context.user_data['stage'] = EditorStage.WORKSPACE  # Start in workspace view
+    context.user_data['mockup_files'] = design.mockup_file_ids.copy()
+    context.user_data['print_files'] = design.print_file_ids.copy()
+    context.user_data['file_types'] = design.file_types.copy()
+    context.user_data['editing_existing'] = True  # Flag to indicate edit mode
+
+    # Send workspace message
+    text, markup = Keyboards.get_workspace_stage(
+        design.code,
+        product_line.name_fa,
+        len(design.mockup_file_ids),
+        len(design.print_file_ids)
+    )
+
+    try:
+        msg = await update.callback_query.message.reply_text(
+            text,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        context.user_data['workspace_message_id'] = msg.message_id
+
+        # Dismiss the callback
+        await update.callback_query.edit_message_text(
+            f"✏️ شما در حال ویرایش طرح {design.code} هستید.\n"
+            f"فایل‌های فعلی بارگذاری شد."
+        )
+
+        # Start inactivity timer
+        _reset_inactivity_timer(context, user_id)
+
+        logging.info(f"Design {design.code} loaded for editing by user {user_id}")
+
+    except Exception as e:
+        logging.error(f"Failed to load design for edit: {e}")
+        await update.callback_query.answer(
+            "❌ خطا در بارگذاری طرح",
+            show_alert=True
+        )
+
+
+@require_role('editor', 'sudo', rate_limit_action='code_generation')
 async def start_new_design(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -246,11 +319,16 @@ async def start_new_design(
     # Validate product line
     product_line: Optional[ProductLine] = ProductLine.get_by_prefix(prefix)
     if not product_line:
+        logging.warning(f"User {user_id} tried to start design with invalid prefix: {prefix}")
         await update.message.reply_text(f"❌ خط تولید '{prefix}' یافت نشد.")
         return
 
     if not product_line.is_fully_configured():
         missing: str = ', '.join(product_line.missing_groups())
+        logging.warning(
+            f"User {user_id} tried to start design for unconfigured line {prefix}. "
+            f"Missing: {missing}"
+        )
         await update.message.reply_text(
             f"⚠️ گروه‌های این خط تولید تنظیم نشده‌اند:\n{missing}\n\n"
             f"لطفا ابتدا از طریق منوی Sudo اقدام کنید."
@@ -260,6 +338,7 @@ async def start_new_design(
     # Generate code
     try:
         code, design = CodeService.generate_code(prefix, user.user_id, user.first_name)
+        logging.info(f"✅ Code {code} generated for user {user_id} ({user.first_name})")
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {str(e)}")
         return
@@ -290,7 +369,7 @@ async def start_new_design(
 # File Handler — Stage Aware
 # ---------------------------------------------------------------------------
 
-@require_role('editor', 'sudo')
+@require_role('editor', 'sudo', rate_limit_action='file_upload')
 async def handle_files(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -298,7 +377,13 @@ async def handle_files(
     """
     Receives files from editor.
     Stage-aware: mockup stage → goes to mockup_files, print stage → print_files.
+    Also handles restore ZIP file upload.
     """
+    # ── Check for restore file upload ────────────────────────────────
+    if context.user_data.get('awaiting_restore_file'):
+        await _handle_restore_file(update, context)
+        return
+
     stage: Optional[EditorStage] = context.user_data.get('stage')
 
     # Only accept files during active upload stages
@@ -334,14 +419,19 @@ async def handle_files(
         _clear_editor_state(context)
         return
 
-    # Extract file_id
+    # Extract file_id and determine type
     if update.message.photo:
         file_id: str = update.message.photo[-1].file_id
+        file_type = 'photo'
     elif update.message.document:
         file_id = update.message.document.file_id
+        file_type = 'document'
     else:
         await update.message.reply_text("❌ لطفا فقط عکس یا فایل ارسال کنید.")
         return
+
+    # Store file type mapping
+    context.user_data.setdefault('file_types', {})[file_id] = file_type
 
     # Add to correct list
     if stage == EditorStage.MOCKUP:
@@ -421,12 +511,6 @@ async def editor_callbacks(
     elif data == "stage_print_clear":
         await _handle_clear_request(query, context, chat_id, stage="print")
 
-    elif data == "workspace_clear_mockup":
-        await _handle_clear_request(query, context, chat_id, stage="mockup")
-
-    elif data == "workspace_clear_print":
-        await _handle_clear_request(query, context, chat_id, stage="print")
-
     elif data == "clear_confirmed_mockup":
         context.user_data['mockup_files'] = []
         context.user_data['stage'] = EditorStage.MOCKUP
@@ -460,6 +544,38 @@ async def editor_callbacks(
 
     elif data == "cancel_submission":
         await _handle_cancel(query, context)
+
+    # -----------------------------------------------------------------------
+    # File management
+    # -----------------------------------------------------------------------
+
+    elif data == "manage_mockups":
+        await _handle_manage_files(query, context, chat_id, stage="mockup")
+
+    elif data == "manage_prints":
+        await _handle_manage_files(query, context, chat_id, stage="print")
+
+    elif data.startswith("remove_mockup_"):
+        index = int(data.split("_")[-1])
+        await _handle_remove_file(query, context, chat_id, stage="mockup", index=index)
+
+    elif data.startswith("remove_print_"):
+        index = int(data.split("_")[-1])
+        await _handle_remove_file(query, context, chat_id, stage="print", index=index)
+
+    elif data == "manage_clear_mockup":
+        context.user_data['mockup_files'] = []
+        context.user_data['stage'] = EditorStage.WORKSPACE
+        await _render_stage(context, chat_id)
+
+    elif data == "manage_clear_print":
+        context.user_data['print_files'] = []
+        context.user_data['stage'] = EditorStage.WORKSPACE
+        await _render_stage(context, chat_id)
+
+    elif data == "manage_back":
+        context.user_data['stage'] = EditorStage.WORKSPACE
+        await _render_stage(context, chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +644,152 @@ async def _handle_clear_request(query, context, chat_id: int, stage: str) -> Non
         logging.warning(f"Could not edit for clear confirmation: {e}")
 
 
+async def _handle_manage_files(query, context, chat_id: int, stage: str) -> None:
+    """Show file management view for individual file removal"""
+    code = context.user_data.get('code', '')
+    product_name = context.user_data.get('product_name', '')
+    files = context.user_data.get(f'{stage}_files', [])
+
+    text, markup = Keyboards.get_manage_files_stage(stage, files, code, product_name)
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.warning(f"Could not edit for file management: {e}")
+
+
+async def _handle_remove_file(query, context, chat_id: int, stage: str, index: int) -> None:
+    """Remove a single file at the given index"""
+    files_key = f'{stage}_files'
+    files = context.user_data.get(files_key, [])
+
+    if index < 0 or index >= len(files):
+        await query.answer("❌ فایل یافت نشد", show_alert=True)
+        return
+
+    removed = files.pop(index)
+    context.user_data[files_key] = files
+
+    # Also remove from file_types if present
+    file_types = context.user_data.get('file_types', {})
+    file_types.pop(removed, None)
+    context.user_data['file_types'] = file_types
+
+    # Re-render the management view
+    code = context.user_data.get('code', '')
+    product_name = context.user_data.get('product_name', '')
+    text, markup = Keyboards.get_manage_files_stage(stage, files, code, product_name)
+
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.warning(f"Could not edit for file removal: {e}")
+
+    stage_label = "موکاپ" if stage == "mockup" else "فایل چاپی"
+    await query.answer(f"❌ {stage_label} {index + 1} حذف شد")
+
+
+async def _notify_reviewers_of_edit(bot, design: Design) -> None:
+    """
+    After an editor updates a pending design, delete old reviewer messages
+    and resend updated files so reviewers see the latest version.
+    """
+    code = design.code
+    product_line = ProductLine.get_by_id(design.product_line_id)
+    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else ""
+
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ تایید", callback_data=f"approve_{code}"),
+            InlineKeyboardButton("❌ رد",    callback_data=f"reject_{code}")
+        ]
+    ])
+
+    for reviewer_id, old_msg_ids in design.all_reviewer_message_pairs():
+        # Delete old messages
+        for msg_id in old_msg_ids:
+            try:
+                await bot.delete_message(chat_id=reviewer_id, message_id=msg_id)
+            except Exception as e:
+                logging.warning(f"Could not delete old msg {msg_id} from reviewer {reviewer_id}: {e}")
+
+        # Resend updated mockups
+        new_msg_ids = []
+        mockups = design.mockup_file_ids
+        file_types = design.file_types
+
+        if mockups:
+            try:
+                if len(mockups) == 1:
+                    fid = mockups[0]
+                    caption = f"📦 {pl_name} | کد: {code}\n👤 طراح: {design.editor_name}\n\n🔄 بروزرسانی شده"
+                    is_photo = file_types.get(fid) == 'photo'
+                    if is_photo:
+                        m = await bot.send_photo(reviewer_id, photo=fid, caption=caption, reply_markup=markup)
+                    else:
+                        m = await bot.send_document(reviewer_id, document=fid, caption=caption, reply_markup=markup)
+                    new_msg_ids.append(m.message_id)
+                else:
+                    for chunk_start in range(0, len(mockups), 10):
+                        chunk = mockups[chunk_start:chunk_start + 10]
+                        media_group = []
+                        for i, fid in enumerate(chunk):
+                            idx = chunk_start + i
+                            cap = (
+                                f"📦 {pl_name} | کد: {code} ({idx+1}/{len(mockups)})\n"
+                                f"👤 طراح: {design.editor_name}\n🔄 بروزرسانی شده"
+                            ) if idx == 0 else ""
+                            is_photo = file_types.get(fid) == 'photo'
+                            if is_photo:
+                                media_group.append(InputMediaPhoto(media=fid, caption=cap))
+                            else:
+                                media_group.append(InputMediaDocument(media=fid, caption=cap))
+                        msgs = await bot.send_media_group(reviewer_id, media=media_group)
+                        new_msg_ids.extend([m.message_id for m in msgs])
+
+                    # Action buttons as separate message
+                    if new_msg_ids:
+                        m = await bot.send_message(
+                            reviewer_id,
+                            f"📋 بررسی {pl_name} — {code}\n🔄 بروزرسانی شده",
+                            reply_markup=markup,
+                            reply_to_message_id=new_msg_ids[-1]
+                        )
+                        new_msg_ids.append(m.message_id)
+            except Exception as e:
+                logging.error(f"Failed to resend design {code} to reviewer {reviewer_id}: {e}")
+
+        # Resend print files
+        unique_prints = list(dict.fromkeys(design.print_file_ids))
+        for i, fid in enumerate(unique_prints):
+            try:
+                await bot.send_document(
+                    reviewer_id,
+                    document=fid,
+                    caption=f"🖨 فایل چاپی {i+1}/{len(unique_prints)} — {code}"
+                )
+                await asyncio.sleep(TELEGRAM_SEND_DELAY)
+            except Exception as e:
+                logging.error(f"Failed to resend print {i+1} to reviewer {reviewer_id}: {e}")
+
+        # Save new message IDs
+        if new_msg_ids:
+            design.set_reviewer_messages(reviewer_id, new_msg_ids)
+
+    # Save updated reviewer message IDs
+    try:
+        design.save_reviewer_messages()
+    except Exception as e:
+        logging.error(f"Failed to save reviewer message IDs for {code}: {e}")
+
+
 async def _handle_preview_files(query, context, chat_id: int) -> None:
     """
     Send mockups as media group + prints as individual documents.
@@ -539,7 +801,7 @@ async def _handle_preview_files(query, context, chat_id: int) -> None:
 
     await query.answer()
 
-    # Send mockups as media group
+    # Send mockups as media group (chunked to Telegram's 10-item limit)
     if mockups:
         try:
             if len(mockups) == 1:
@@ -548,15 +810,19 @@ async def _handle_preview_files(query, context, chat_id: int) -> None:
                     caption=f"🎨 موکاپ 1/1 — {code}"
                 )
             else:
-                media_group = [
-                    InputMediaPhoto(
-                        media=fid,
-                        caption=f"🎨 موکاپ {i+1}/{len(mockups)} — {code}"
-                        if i == 0 else ""
-                    )
-                    for i, fid in enumerate(mockups)
-                ]
-                await query.message.chat.send_media_group(media=media_group)
+                for chunk_start in range(0, len(mockups), 10):
+                    chunk = mockups[chunk_start:chunk_start + 10]
+                    chunk_num = chunk_start // 10 + 1
+                    total_chunks = (len(mockups) + 9) // 10
+                    media_group = [
+                        InputMediaPhoto(
+                            media=fid,
+                            caption=f"🎨 موکاپ {chunk_start+i+1}/{len(mockups)} — {code}"
+                            if i == 0 and chunk_num == 1 else ""
+                        )
+                        for i, fid in enumerate(chunk)
+                    ]
+                    await query.message.chat.send_media_group(media=media_group)
         except Exception as e:
             logging.error(f"Failed to send mockup preview: {e}")
             await query.message.chat.send_message("❌ خطا در ارسال موکاپ‌ها.")
@@ -570,7 +836,7 @@ async def _handle_preview_files(query, context, chat_id: int) -> None:
                     document=fid,
                     caption=f"🖨 فایل چاپی {i+1}/{len(unique_prints)} — {code}"
                 )
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(TELEGRAM_SEND_DELAY)
             except Exception as e:
                 logging.error(f"Failed to send print preview {i}: {e}")
 
@@ -611,6 +877,7 @@ async def _handle_submit_to_reviewer(
     prints:      list = context.user_data.get('print_files', [])
     product_name: str = context.user_data['product_name']
     editor_name:  str = context.user_data['db_user'].first_name
+    file_types:  dict = context.user_data.get('file_types', {})
 
     # Final validation
     if not mockups or not prints:
@@ -620,7 +887,12 @@ async def _handle_submit_to_reviewer(
         )
         return
 
-    await safe_edit_message(query, "⏳ در حال ارسال برای تایید...")
+    editing_mode = context.user_data.get('editing_existing', False)
+
+    if editing_mode:
+        await safe_edit_message(query, "⏳ در حال بروزرسانی طرح...")
+    else:
+        await safe_edit_message(query, "⏳ در حال ارسال برای تایید...")
 
     # Save files to design
     design: Optional[Design] = Design.get_by_code(code)
@@ -629,8 +901,19 @@ async def _handle_submit_to_reviewer(
         _clear_editor_state(context)
         return
 
+    # Race condition guard: re-check status before saving in edit mode
+    if editing_mode and design.status != DesignStatus.PENDING:
+        await safe_edit_message(
+            query,
+            f"❌ طرح {code} توسط ناظر پردازش شده است.\n"
+            f"ویرایش امکان‌پذیر نیست."
+        )
+        _clear_editor_state(context)
+        return
+
     design.mockup_file_ids = mockups
     design.print_file_ids  = prints
+    design.file_types = file_types
 
     try:
         design.save()
@@ -643,6 +926,23 @@ async def _handle_submit_to_reviewer(
         )
         return
 
+    # If editing, update reviewers with new files
+    if editing_mode:
+        # Delete old reviewer messages and resend updated files
+        await _notify_reviewers_of_edit(context.bot, design)
+
+        await safe_edit_message(
+            query,
+            f"✅ طرح {code} بروزرسانی شد.\n\n"
+            f"📎 موکاپ: {len(mockups)} فایل\n"
+            f"🖨 چاپ: {len(prints)} فایل\n\n"
+            f"⏳ طرح همچنان در انتظار بررسی ناظر است."
+        )
+        _clear_editor_state(context)
+        logging.info(f"Design {code} updated by user {editor_name}")
+        return
+
+    # New submission - send to reviewers
     # Get reviewers
     reviewers: list[User] = User.get_by_role('reviewer')
     if not reviewers:
@@ -659,17 +959,17 @@ async def _handle_submit_to_reviewer(
         ]
     ])
 
-    # Send to each reviewer
-    successful_sends: int = 0
-    total_mockups:    int = len(mockups)
-
-    for reviewer in reviewers:
+    # Send to all reviewers in parallel
+    async def send_to_reviewer(reviewer: User) -> Tuple[User, bool, list[int]]:
+        """Send design to a single reviewer. Returns (reviewer, success, msg_ids)"""
         msg_ids: list[int] = []
         try:
             if total_mockups == 1:
                 caption = f"📦 {product_name} | کد: {code}\n👤 طراح: {editor_name}"
                 fid = mockups[0]
-                if isinstance(fid, str) and fid.startswith(('AgAC', 'AQA')):
+                # Use stored file type instead of file_id prefix
+                is_photo = file_types.get(fid) == 'photo'
+                if is_photo:
                     m = await context.bot.send_photo(
                         reviewer.user_id, photo=fid,
                         caption=caption, reply_markup=markup
@@ -682,36 +982,59 @@ async def _handle_submit_to_reviewer(
                 msg_ids.append(m.message_id)
 
             else:
-                media_group = []
-                for i, fid in enumerate(mockups):
-                    cap = (
-                        f"📦 {product_name} | کد: {code} ({i+1}/{total_mockups})\n"
-                        f"👤 طراح: {editor_name}"
-                    ) if i == 0 else ""
-                    if isinstance(fid, str) and fid.startswith(('AgAC', 'AQA')):
-                        media_group.append(InputMediaPhoto(media=fid, caption=cap))
-                    else:
-                        media_group.append(InputMediaDocument(media=fid, caption=cap))
+                # Send mockups chunked to Telegram's 10-item limit
+                for chunk_start in range(0, total_mockups, 10):
+                    chunk = mockups[chunk_start:chunk_start + 10]
+                    media_group = []
+                    for i, fid in enumerate(chunk):
+                        idx = chunk_start + i
+                        cap = (
+                            f"📦 {product_name} | کد: {code} ({idx+1}/{total_mockups})\n"
+                            f"👤 طراح: {editor_name}"
+                        ) if idx == 0 else ""
+                        # Use stored file type instead of file_id prefix
+                        is_photo = file_types.get(fid) == 'photo'
+                        if is_photo:
+                            media_group.append(InputMediaPhoto(media=fid, caption=cap))
+                        else:
+                            media_group.append(InputMediaDocument(media=fid, caption=cap))
 
-                msgs = await context.bot.send_media_group(
-                    reviewer.user_id, media=media_group
-                )
-                msg_ids.extend([m.message_id for m in msgs])
+                    msgs = await context.bot.send_media_group(
+                        reviewer.user_id, media=media_group
+                    )
+                    msg_ids.extend([m.message_id for m in msgs])
 
-                # Action buttons as separate message
-                m = await context.bot.send_message(
-                    reviewer.user_id,
-                    f"📋 بررسی {product_name} — {code}",
-                    reply_markup=markup,
-                    reply_to_message_id=msg_ids[-1]
-                )
-                msg_ids.append(m.message_id)
+                # Action buttons as separate message (reply to last mockup)
+                if msg_ids:
+                    m = await context.bot.send_message(
+                        reviewer.user_id,
+                        f"📋 بررسی {product_name} — {code}",
+                        reply_markup=markup,
+                        reply_to_message_id=msg_ids[-1]
+                    )
+                    msg_ids.append(m.message_id)
 
-            design.set_reviewer_messages(reviewer.user_id, msg_ids)
-            successful_sends += 1
+            return reviewer, True, msg_ids
 
         except Exception as e:
             logging.error(f"Failed to send design {code} to reviewer {reviewer.user_id}: {e}")
+            return reviewer, False, []
+
+    # Execute all sends in parallel
+    total_mockups: int = len(mockups)
+    send_tasks = [send_to_reviewer(r) for r in reviewers]
+    results = await asyncio.gather(*send_tasks, return_exceptions=True)
+
+    # Process results
+    successful_sends: int = 0
+    for result in results:
+        if isinstance(result, Exception):
+            logging.error(f"Reviewer send task failed: {result}")
+            continue
+        reviewer, success, msg_ids = result
+        if success and msg_ids:
+            design.set_reviewer_messages(reviewer.user_id, msg_ids)
+            successful_sends += 1
 
     # Save reviewer message IDs
     if successful_sends > 0:
@@ -745,3 +1068,83 @@ async def _handle_submit_to_reviewer(
 
     # Clean up state
     _clear_editor_state(context)
+
+
+# ---------------------------------------------------------------------------
+# Restore Handler
+# ---------------------------------------------------------------------------
+
+async def _handle_restore_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle ZIP file upload for restore"""
+    context.user_data.pop('awaiting_restore_file', None)
+
+    # Check it's a document, not a photo
+    if not update.message.document:
+        await update.message.reply_text("❌ لطفاً فایل ZIP را به صورت document ارسال کنید.")
+        return
+
+    doc = update.message.document
+    if not doc.file_name or not doc.file_name.endswith('.zip'):
+        await update.message.reply_text("❌ فایل باید فرمت .zip داشته باشد.")
+        return
+
+    # Check file size (max 100MB)
+    if doc.file_size and doc.file_size > 100 * 1024 * 1024:
+        await update.message.reply_text("❌ فایل بیش از ۱۰۰ مگابایت است.")
+        return
+
+    status_msg = await update.message.reply_text("⏳ در حال دانلود فایل بکاپ...")
+
+    try:
+        # Download the file
+        file = await context.bot.get_file(doc.file_id)
+        temp_dir = tempfile.mkdtemp()
+        zip_path = os.path.join(temp_dir, doc.file_name)
+        await file.download_to_drive(zip_path)
+
+        await status_msg.edit_text("🔍 بررسی فایل بکاپ...")
+
+        # Find SQL file in ZIP
+        from services.restore_service import RestoreService
+        sql_name = RestoreService.find_sql_in_zip(zip_path)
+        if not sql_name:
+            await status_msg.edit_text("❌ فایل SQL در بکاپ یافت نشد.\nفرمت بکاپ نامعتبر است.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        # Extract SQL file
+        sql_path = os.path.join(temp_dir, sql_name)
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            z.extract(sql_name, temp_dir)
+
+        # Confirm with user
+        context.user_data['restore_pending'] = {
+            'zip_path': zip_path,
+            'sql_path': sql_path,
+            'temp_dir': temp_dir,
+            'doc_name': doc.file_name,
+        }
+
+        await status_msg.edit_text(
+            f"⚠️ تایید ریستور\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📁 فایل: {doc.file_name}\n"
+            f"📦 حجم: {doc.file_size / 1024:.0f} KB\n\n"
+            f"این عملیات:\n"
+            f"• دیتابیس فعلی را پاک و با بکاپ جایگزین می‌کند\n"
+            f"• فایل‌های public را بازنویسی می‌کند\n"
+            f"• ربات ریستارت می‌شود\n\n"
+            f"آیا مطمئن هستید؟",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ بله، ریستور کن", callback_data="confirm_restore"),
+                InlineKeyboardButton("❌ انصراف", callback_data="cancel_restore"),
+            ]])
+        )
+
+    except Exception as e:
+        logging.error(f"Restore download failed: {e}")
+        await status_msg.edit_text(f"❌ خطا در دانلود فایل: {e}")
+        context.user_data.pop('restore_pending', None)

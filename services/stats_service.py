@@ -5,6 +5,13 @@ from config.database import get_db_connection
 from utils.helpers import get_tehran_time, to_utc_naive
 from utils.enums import DesignStatus
 
+PERSIAN_WEEKDAYS = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه']
+
+
+def _persian_weekday(dt) -> str:
+    """Convert Python weekday (Mon=0) to Iranian weekday (Sat=0)"""
+    return PERSIAN_WEEKDAYS[(dt.weekday() + 2) % 7]
+
 
 class StatsService:
 
@@ -22,6 +29,8 @@ class StatsService:
             week_utc = to_utc_naive(week_start)
 
             # Main aggregation query
+            # "all-time" counts respect stats_reset_at; "today"/"week" always show current period
+            # Excludes deleted designs from all counts
             cursor.execute("""
                 SELECT
                     pl.id,
@@ -29,28 +38,38 @@ class StatsService:
                     pl.name_fa,
                     pl.icon,
                     pl.is_active,
+                    pl.stats_reset_at,
 
-                    COUNT(d.id)                                              AS total_all,
-                    SUM(CASE WHEN d.status = 'pending'  THEN 1 ELSE 0 END)  AS pending_all,
-                    SUM(CASE WHEN d.status = 'approved' THEN 1 ELSE 0 END)  AS approved_all,
-                    SUM(CASE WHEN d.status = 'rejected' THEN 1 ELSE 0 END)  AS rejected_all,
-                    SUM(CASE WHEN d.status = 'deleted'  THEN 1 ELSE 0 END)  AS deleted_all,
-
-                    SUM(CASE WHEN d.created_at  >= %s THEN 1 ELSE 0 END)    AS submitted_week,
+                    SUM(CASE WHEN d.status != 'deleted'
+                             AND (pl.stats_reset_at IS NULL OR d.created_at >= pl.stats_reset_at)
+                             THEN 1 ELSE 0 END)                                    AS total_all,
+                    SUM(CASE WHEN d.status = 'pending'
+                             AND (pl.stats_reset_at IS NULL OR d.created_at >= pl.stats_reset_at)
+                             THEN 1 ELSE 0 END)                                    AS pending_all,
                     SUM(CASE WHEN d.status = 'approved'
-                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)     AS approved_week,
+                             AND (pl.stats_reset_at IS NULL OR d.reviewed_at >= pl.stats_reset_at)
+                             THEN 1 ELSE 0 END)                                    AS approved_all,
                     SUM(CASE WHEN d.status = 'rejected'
-                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)     AS rejected_week,
+                             AND (pl.stats_reset_at IS NULL OR d.reviewed_at >= pl.stats_reset_at)
+                             THEN 1 ELSE 0 END)                                    AS rejected_all,
 
-                    SUM(CASE WHEN d.created_at  >= %s THEN 1 ELSE 0 END)    AS submitted_today,
+                    SUM(CASE WHEN d.status != 'deleted'
+                             AND d.created_at  >= %s THEN 1 ELSE 0 END)            AS submitted_week,
                     SUM(CASE WHEN d.status = 'approved'
-                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)     AS approved_today,
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS approved_week,
                     SUM(CASE WHEN d.status = 'rejected'
-                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)     AS rejected_today
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS rejected_week,
+
+                    SUM(CASE WHEN d.status != 'deleted'
+                             AND d.created_at  >= %s THEN 1 ELSE 0 END)            AS submitted_today,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS approved_today,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS rejected_today
 
                 FROM product_lines pl
                 LEFT JOIN designs d ON pl.id = d.product_line_id
-                GROUP BY pl.id, pl.code_prefix, pl.name_fa, pl.icon, pl.is_active
+                GROUP BY pl.id, pl.code_prefix, pl.name_fa, pl.icon, pl.is_active, pl.stats_reset_at
                 ORDER BY pl.display_order
             """, (week_utc, week_utc, week_utc, today_utc, today_utc, today_utc))
 
@@ -146,6 +165,7 @@ class StatsService:
                 SELECT
                     d.editor_user_id,
                     d.editor_name,
+                    MAX(u.stats_reset_at) AS stats_reset_at,
                     COUNT(*)                                                     AS submitted_all,
                     SUM(CASE WHEN d.status = 'approved' THEN 1 ELSE 0 END)      AS approved_all,
                     SUM(CASE WHEN d.status = 'rejected' THEN 1 ELSE 0 END)      AS rejected_all,
@@ -161,6 +181,8 @@ class StatsService:
                     SUM(CASE WHEN d.status = 'rejected'
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_today
                 FROM designs d
+                LEFT JOIN users u ON d.editor_user_id = u.user_id
+                WHERE (u.stats_reset_at IS NULL OR d.created_at >= u.stats_reset_at)
                 GROUP BY d.editor_user_id, d.editor_name
                 ORDER BY submitted_all DESC
             """, (week_utc, week_utc, week_utc, today_utc, today_utc, today_utc))
@@ -186,6 +208,7 @@ class StatsService:
                 SELECT
                     d.reviewer_user_id,
                     d.reviewer_name,
+                    MAX(u.stats_reset_at) AS stats_reset_at,
                     COUNT(*)                                                     AS reviewed_all,
                     SUM(CASE WHEN d.status = 'approved' THEN 1 ELSE 0 END)      AS approved_all,
                     SUM(CASE WHEN d.status = 'rejected' THEN 1 ELSE 0 END)      AS rejected_all,
@@ -200,8 +223,10 @@ class StatsService:
                     SUM(CASE WHEN d.status = 'rejected'
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_today
                 FROM designs d
+                LEFT JOIN users u ON d.reviewer_user_id = u.user_id
                 WHERE d.status IN ('approved', 'rejected')
                   AND d.reviewer_user_id IS NOT NULL
+                  AND (u.stats_reset_at IS NULL OR d.reviewed_at >= u.stats_reset_at)
                 GROUP BY d.reviewer_user_id, d.reviewer_name
                 ORDER BY reviewed_all DESC
             """, (week_utc, week_utc, week_utc, today_utc, today_utc, today_utc))
@@ -222,9 +247,11 @@ class StatsService:
             )
 
             cursor.execute("""
-                SELECT editor_name, COUNT(*) as count
-                FROM designs
-                GROUP BY editor_user_id, editor_name
+                SELECT d.editor_name, COUNT(*) as count
+                FROM designs d
+                LEFT JOIN users u ON d.editor_user_id = u.user_id
+                WHERE (u.stats_reset_at IS NULL OR d.created_at >= u.stats_reset_at)
+                GROUP BY d.editor_user_id, d.editor_name
                 ORDER BY count DESC LIMIT 1
             """)
             top_editor_all = cursor.fetchone()
@@ -239,11 +266,13 @@ class StatsService:
             top_editor_today = cursor.fetchone()
 
             cursor.execute("""
-                SELECT reviewer_name, COUNT(*) as count
-                FROM designs
-                WHERE status IN ('approved', 'rejected')
-                  AND reviewer_user_id IS NOT NULL
-                GROUP BY reviewer_user_id, reviewer_name
+                SELECT d.reviewer_name, COUNT(*) as count
+                FROM designs d
+                LEFT JOIN users u ON d.reviewer_user_id = u.user_id
+                WHERE d.status IN ('approved', 'rejected')
+                  AND d.reviewer_user_id IS NOT NULL
+                  AND (u.stats_reset_at IS NULL OR d.reviewed_at >= u.stats_reset_at)
+                GROUP BY d.reviewer_user_id, d.reviewer_name
                 ORDER BY count DESC LIMIT 1
             """)
             top_reviewer_all = cursor.fetchone()
@@ -285,9 +314,9 @@ class StatsService:
                     SUM(CASE WHEN status = 'pending'  THEN 1 ELSE 0 END) AS pending,
                     SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
                     SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-                    SUM(CASE WHEN status = 'deleted'  THEN 1 ELSE 0 END) AS deleted,
                     SUM(CASE WHEN created_at >= %s    THEN 1 ELSE 0 END) AS submitted_today
                 FROM designs
+                WHERE status != 'deleted'
             """, (today_utc,))
             totals = cursor.fetchone()
 
@@ -326,3 +355,103 @@ class StatsService:
         except Exception as e:
             logging.warning(f"Could not read uptime: {e}")
             return "نامشخص"
+
+    @staticmethod
+    def get_daily_summary() -> dict:
+        """Gather all data needed for the rich daily log"""
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            now = get_tehran_time()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            days_since_saturday = (today_start.weekday() + 2) % 7
+            week_start = today_start - timedelta(days=days_since_saturday)
+            today_utc = to_utc_naive(today_start)
+            week_utc = to_utc_naive(week_start)
+
+            # 1. Today's activity per product line
+            cursor.execute("""
+                SELECT
+                    pl.code_prefix, pl.name_fa, pl.icon,
+                    SUM(CASE WHEN d.created_at >= %s THEN 1 ELSE 0 END)    AS submitted_today,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)   AS approved_today,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)   AS rejected_today
+                FROM product_lines pl
+                LEFT JOIN designs d ON pl.id = d.product_line_id
+                WHERE pl.is_active = TRUE
+                GROUP BY pl.id, pl.code_prefix, pl.name_fa, pl.icon
+                ORDER BY pl.display_order
+            """, (today_utc, today_utc, today_utc))
+            today_lines = cursor.fetchall()
+
+            # 2. Pending codes (still waiting for review)
+            cursor.execute("""
+                SELECT d.code, pl.name_fa, pl.icon, d.created_at
+                FROM designs d
+                JOIN product_lines pl ON d.product_line_id = pl.id
+                WHERE d.status = 'pending'
+                ORDER BY d.created_at ASC
+            """)
+            pending_codes = cursor.fetchall()
+
+            # 3. Today's top editor
+            cursor.execute("""
+                SELECT editor_name, COUNT(*) as count
+                FROM designs
+                WHERE created_at >= %s
+                GROUP BY editor_user_id, editor_name
+                ORDER BY count DESC LIMIT 1
+            """, (today_utc,))
+            top_editor_today = cursor.fetchone()
+
+            # 4. Today's top reviewer
+            cursor.execute("""
+                SELECT reviewer_name, COUNT(*) as count
+                FROM designs
+                WHERE status IN ('approved', 'rejected')
+                  AND reviewed_at >= %s
+                  AND reviewer_user_id IS NOT NULL
+                GROUP BY reviewer_user_id, reviewer_name
+                ORDER BY count DESC LIMIT 1
+            """, (today_utc,))
+            top_reviewer_today = cursor.fetchone()
+
+            # 5. Weekly totals
+            cursor.execute("""
+                SELECT
+                    COUNT(*)                                                     AS submitted_week,
+                    SUM(CASE WHEN status = 'approved'
+                             AND reviewed_at >= %s THEN 1 ELSE 0 END)           AS approved_week,
+                    SUM(CASE WHEN status = 'rejected'
+                             AND reviewed_at >= %s THEN 1 ELSE 0 END)           AS rejected_week
+                FROM designs
+                WHERE created_at >= %s
+            """, (week_utc, week_utc, week_utc))
+            weekly = cursor.fetchone()
+
+            # 6. System totals (excludes deleted)
+            cursor.execute("""
+                SELECT
+                    COUNT(*)                                                     AS total,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)         AS pending,
+                    SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END)        AS approved
+                FROM designs
+                WHERE status != 'deleted'
+            """)
+            system = cursor.fetchone()
+
+            return {
+                'date': now.strftime('%Y/%m/%d'),
+                'weekday': _persian_weekday(now),
+                'today_lines': today_lines,
+                'pending_codes': pending_codes,
+                'top_editor_today': top_editor_today,
+                'top_reviewer_today': top_reviewer_today,
+                'weekly': weekly,
+                'system': system,
+            }
+        finally:
+            cursor.close()
+            conn.close()

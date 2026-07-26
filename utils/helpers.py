@@ -18,7 +18,7 @@ def get_tehran_time(dt: Optional[datetime] = None) -> datetime:
         datetime object with Tehran timezone
     """
     if dt is None:
-        return datetime.now(TEHRAN_TZ)
+        return datetime.now(pytz.utc).astimezone(TEHRAN_TZ)
     if dt.tzinfo is None:
         dt = pytz.UTC.localize(dt)
     return dt.astimezone(TEHRAN_TZ)

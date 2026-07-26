@@ -27,6 +27,7 @@ class ProductLine:
         metadata=None,
         group_products: Optional[int] = None,
         group_print: Optional[int] = None,
+        stats_reset_at=None,
         **kwargs
     ):
         self.id = id
@@ -46,6 +47,7 @@ class ProductLine:
         self.metadata = metadata
         self.group_products = group_products
         self.group_print = group_print
+        self.stats_reset_at = stats_reset_at
         
         # This MUST be inside __init__, not at class level
         if kwargs:
@@ -227,20 +229,83 @@ class ProductLine:
     def activate(self):
         self.update(is_active=True)
 
-    def get_stats(self) -> dict:
-        """Get statistics for this product line"""
+    def has_approved_designs(self) -> bool:
+        """Check if this product line has any approved designs"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM designs
+                WHERE product_line_id = %s AND status = 'approved'
+            """, (self.id,))
+            count = cursor.fetchone()[0]
+            return count > 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def has_any_designs(self) -> bool:
+        """Check if this product line has any designs at all"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM designs
+                WHERE product_line_id = %s
+            """, (self.id,))
+            count = cursor.fetchone()[0]
+            return count > 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def delete(self):
+        """
+        Delete this product line permanently.
+        Also cleans up locked codes and group message records.
+        Does NOT delete designs — caller must ensure no designs exist.
+        """
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM designs_locked_codes WHERE product_line_id = %s", (self.id,))
+            cursor.execute("DELETE FROM design_group_messages WHERE design_id IN (SELECT id FROM designs WHERE product_line_id = %s)", (self.id,))
+            cursor.execute("DELETE FROM product_lines WHERE id = %s", (self.id,))
+            conn.commit()
+            logging.info(f"🗑️ Product line {self.code_prefix} ({self.name_fa}) deleted")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to delete product line {self.code_prefix}: {e}")
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_stats(self, editor_user_id: int = None) -> dict:
+        """Get statistics for this product line, optionally filtered by editor"""
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
-            cursor.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-                    SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-                    SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected
-                FROM designs
-                WHERE product_line_id = %s
-            """, (self.id,))
+            if editor_user_id:
+                cursor.execute("""
+                    SELECT
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
+                        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected
+                    FROM designs
+                    WHERE product_line_id = %s AND editor_user_id = %s AND status != 'deleted'
+                """, (self.id, editor_user_id))
+            else:
+                cursor.execute("""
+                    SELECT
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
+                        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected
+                    FROM designs
+                    WHERE product_line_id = %s AND status != 'deleted'
+                """, (self.id,))
             stats = cursor.fetchone()
 
             cursor.execute("""

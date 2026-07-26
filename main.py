@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import html
+import os
 from datetime import time
 from utils.enums import DesignStatus
 import traceback
@@ -13,7 +14,7 @@ from telegram.ext import (
 )
 
 # Configuration & Infrastructure
-from config.settings import BOT_TOKEN, BACKUP_TIME_HOUR, BACKUP_TIME_MINUTE, LOG_LEVEL, LOG_FORMAT, LOG_GROUP_ID
+from config.settings import BOT_TOKEN, BACKUP_TIME_HOUR, BACKUP_TIME_MINUTE, LOG_LEVEL, LOG_FORMAT, LOG_GROUP_ID, SERVER_BILL_REMINDER_HOUR, SERVER_BILL_REMINDER_MINUTE
 from utils.helpers import get_tehran_time, TEHRAN_TZ
 from config.database import test_connection, init_legacy_tables
 from services.backup_service import BackupService, send_daily_backup
@@ -28,24 +29,36 @@ from migrations.migration_004_migrate_existing_data import Migration004
 from migrations.migration_005_add_groups_and_reviewer_dict import Migration005
 from migrations.migration_006_create_design_group_messages import Migration006
 from migrations.migration_007_add_deleted_status import Migration007
+from migrations.migration_008_add_stats_reset import Migration008
+from migrations.migration_009_add_file_types import Migration009
 
 # Handlers
 from handlers.common import start_command, cancel_command
 from handlers.sudo import (
     switch_role_command, handle_role_switch,
-    manual_backup_command, restart_command, execute_restart,
+    manual_backup_command, restore_command, restart_command, execute_restart,
     group_management_command, group_management_callback,
     handle_group_id_input, status_command, broadcast_update_callback,
     delete_design_command, confirm_delete_design_callback,
-    cleanup_orphans_command
+    cleanup_orphans_command, confirm_restore_callback,
+    backup_type_callback, csv_range_callback
 )
+from handlers.reset_stats import reset_stats_command, reset_stats_callback
 from handlers.stats import stats_command, stats_callback
 from handlers.editor import start_new_design, handle_files, editor_callbacks
 from handlers.reviewer import review_callback
 from handlers.help import help_command, help_callback
+from handlers.search import (
+    search_command, search_filter_callback, search_back_callback,
+    handle_search_code_input
+)
+from handlers.my_designs import (
+    my_designs_command, my_designs_callback
+)
 from handlers.management import (
     add_user_command, remove_user_command, list_users_command, set_role_command,
     list_lines_command, add_line_command, disable_line_command, enable_line_command,
+    delete_line_command,
     lock_code_command, unlock_code_command, locked_codes_command
 )
 from handlers.design_management import (
@@ -54,6 +67,11 @@ from handlers.design_management import (
     confirm_delete_callback,
     pending_designs_command,
     pending_view_callback
+)
+from handlers.server_bill import (
+    server_bill_callback,
+    send_monthly_reminder,
+    send_daily_reminder
 )
 
 # Models
@@ -64,14 +82,20 @@ from models.user import User
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Global handler for uncaught exceptions in any handler.
-    Logs to console, sends to LOG_GROUP_ID, and notifies user if possible.
+    Logs to console, sends sanitized version to LOG_GROUP_ID, and notifies user if possible.
     """
     logging.error("Uncaught exception:", exc_info=context.error)
     tb_str = ''.join(traceback.format_exception(
         type(context.error), context.error, context.error.__traceback__
     ))
 
-    safe_tb = html.escape(tb_str[-3000:])
+    # Sanitize: Remove potential secrets (file paths, env vars, tokens)
+    safe_tb = tb_str
+    # Remove absolute paths
+    safe_tb = safe_tb.replace(os.getcwd(), '<PROJECT_ROOT>')
+    # Truncate for Telegram
+    safe_tb = html.escape(safe_tb[-3000:])
+
     error_msg = (
         f"⚠️ <b>Uncaught Exception</b>\n\n"
         f"<pre>{safe_tb}</pre>"
@@ -112,7 +136,7 @@ def run_db_migrations():
     migrations = [
         Migration001(), Migration002(), Migration003(),
         Migration004(), Migration005(), Migration006(),
-        Migration007()
+        Migration007(), Migration008(), Migration009()
     ]
     manager = MigrationManager()
     manager.run_migrations(migrations)
@@ -127,6 +151,23 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -----------------------------------------------------------------------
     if context.user_data.get('awaiting_group_input'):
         handled = await handle_group_id_input(update, context)
+        if handled:
+            return
+
+    # -----------------------------------------------------------------------
+    # Priority 1.5 — awaiting delete line confirmation
+    # -----------------------------------------------------------------------
+    if context.user_data.get('awaiting_delete_line_confirm'):
+        prefix = context.user_data.pop('awaiting_delete_line_confirm')
+        from handlers.management import _execute_delete_line
+        await _execute_delete_line(update, context, prefix)
+        return
+
+    # -----------------------------------------------------------------------
+    # Priority 1.6 — awaiting search code input
+    # -----------------------------------------------------------------------
+    if context.user_data.get('awaiting_search_code'):
+        handled = await handle_search_code_input(update, context)
         if handled:
             return
 
@@ -181,12 +222,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -----------------------------------------------------------------------
     if text.startswith("📊 آمار") and text != "📊 آمار کلی":
         products = ProductLine.get_all_active()
+        user = User.get_by_id(update.effective_user.id)
+        user_role = user.get_effective_role() if user else None
         for pl in products:
             expected_text = f"📊 آمار {pl.name_fa}"
             if text == expected_text:
-                stats = pl.get_stats()
+                # Editors see only their own stats
+                editor_id = update.effective_user.id if user_role == 'editor' else None
+                stats = pl.get_stats(editor_user_id=editor_id)
+                if editor_id:
+                    header = f"{pl.icon} آمار شخصی — {pl.name_fa}"
+                else:
+                    header = f"{pl.icon} آمار {pl.name_fa}"
                 msg = (
-                    f"{pl.icon} آمار {pl.name_fa}\n\n"
+                    f"{header}\n\n"
                     f"⏳ در انتظار: {stats[DesignStatus.PENDING]}\n"
                     f"✅ تایید شده: {stats[DesignStatus.APPROVED]}\n"
                     f"❌ رد شده: {stats[DesignStatus.REJECTED]}\n"
@@ -211,6 +260,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "💾 بکاپ":
         return await manual_backup_command(update, context)
 
+    if text == "🔧 ریستور":
+        return await restore_command(update, context)
+
     if text == "🔄 ریستارت":
         return await restart_command(update, context)
 
@@ -220,8 +272,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📊 وضعیت":
         return await status_command(update, context)
 
+    if text == "🔄 بازنشانی آمار":
+        return await reset_stats_command(update, context)
+
     if text == "📖 راهنما":
         return await help_command(update, context)
+
+    if text == "🔍 جستجوی پیشرفته":
+        return await search_command(update, context)
+
+    if text == "📋 طرح‌های من":
+        return await my_designs_command(update, context)
 
     # -----------------------------------------------------------------------
     # Fallback
@@ -234,19 +295,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ ورودی نامعتبر. لطفا دوباره امتحان کنید یا /cancel بزنید."
         )
-
-    # -----------------------------------------------------------------------
-    # Fallback
-    # -----------------------------------------------------------------------
-    else:
-        if context.user_data.get('stage'):
-            await update.message.reply_text(
-                "📎 لطفا فایل ارسال کنید یا از دکمه‌های زیر استفاده کنید."
-            )
-        elif any(k.startswith('awaiting_') for k in context.user_data):
-            await update.message.reply_text(
-                "❌ ورودی نامعتبر. لطفا دوباره امتحان کنید یا /cancel بزنید."
-            )
 
 
 async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,9 +366,10 @@ class TelegramLogHandler(logging.Handler):
                 log_entry = self.format(record)
                 self.message_queue.append(log_entry)
                 if not self.is_sending:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(self._process_queue())
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._process_queue())
+            except RuntimeError:
+                pass
             except Exception:
                 pass
             finally:
@@ -369,6 +418,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("start",         start_command))
     application.add_handler(CommandHandler("cancel",        cancel_command))
     application.add_handler(CommandHandler("help",          help_command))
+    application.add_handler(CommandHandler("search",        search_command))
 
     # User management
     application.add_handler(CommandHandler("adduser",       add_user_command))
@@ -381,6 +431,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("addline",       add_line_command))
     application.add_handler(CommandHandler("disableline",   disable_line_command))
     application.add_handler(CommandHandler("enableline",    enable_line_command))
+    application.add_handler(CommandHandler("deleteline",    delete_line_command))
 
     # Code management
     application.add_handler(CommandHandler("lockcode",      lock_code_command))
@@ -418,7 +469,7 @@ if __name__ == "__main__":
     # Editor stage flow
     application.add_handler(CallbackQueryHandler(
         editor_callbacks,
-        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|workspace_clear_mockup|workspace_clear_print|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission)$"
+        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission|manage_mockups|manage_prints|manage_clear_mockup|manage_clear_print|manage_back|remove_mockup_\d+|remove_print_\d+)$"
     ))
 
     # Reviewer
@@ -480,6 +531,53 @@ if __name__ == "__main__":
         pattern=r"^pending_view_"
     ))
 
+    # Restore confirmation
+    application.add_handler(CallbackQueryHandler(
+        confirm_restore_callback,
+        pattern=r"^(confirm_restore|cancel_restore)$"
+    ))
+
+    # Backup type selection
+    application.add_handler(CallbackQueryHandler(
+        backup_type_callback,
+        pattern=r"^(backup_csv|backup_zip)$"
+    ))
+
+    # CSV time range selection
+    application.add_handler(CallbackQueryHandler(
+        csv_range_callback,
+        pattern=r"^(csv_week|csv_month|csv_all|csv_cancel)$"
+    ))
+
+    # Reset stats
+    application.add_handler(CallbackQueryHandler(
+        reset_stats_callback,
+        pattern=r"^(reset_stats_|reset_editor_|reset_reviewer_|reset_line_|confirm_reset_|reset_stats_cancel)"
+    ))
+
+    # Search
+    application.add_handler(CallbackQueryHandler(
+        search_filter_callback,
+        pattern=r"^search_(filter_|set_|execute|clear|cancel|page_|view_)"
+    ))
+
+    application.add_handler(CallbackQueryHandler(
+        search_back_callback,
+        pattern=r"^search_back$"
+    ))
+
+    # My Designs
+    application.add_handler(CallbackQueryHandler(
+        my_designs_callback,
+        pattern=r"^mydesigns_"
+    ))
+
+    # Server bill reminder
+    application.add_handler(CallbackQueryHandler(
+        server_bill_callback,
+        pattern=r"^server_bill_"
+    ))
+
     # -----------------------------------------------------------------------
     # Jobs
     # -----------------------------------------------------------------------
@@ -494,6 +592,22 @@ if __name__ == "__main__":
         send_daily_backup,
         time=t,
         name='daily_backup'
+    )
+
+    # Server bill reminder - monthly on 12th at 9:00 AM Tehran time
+    server_bill_time = time(hour=SERVER_BILL_REMINDER_HOUR, minute=SERVER_BILL_REMINDER_MINUTE, tzinfo=TEHRAN_TZ)
+    application.job_queue.run_monthly(
+        send_monthly_reminder,
+        when=server_bill_time,
+        day=12,
+        name='server_bill_monthly'
+    )
+
+    # Server bill daily follow-up reminder
+    application.job_queue.run_daily(
+        send_daily_reminder,
+        time=server_bill_time,
+        name='server_bill_daily'
     )
 
     logging.info("✅ Bot is ready and polling...")

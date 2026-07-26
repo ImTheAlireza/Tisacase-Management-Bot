@@ -2,6 +2,7 @@ import os
 import shutil
 import asyncio
 import logging
+import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from utils.decorators import require_sudo
@@ -11,6 +12,7 @@ from services.backup_service import BackupService
 from utils.helpers import get_tehran_time
 from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS
 from utils.enums import DesignStatus
+from utils.callback_lock import deduplicate_callback
 
 
 def _verify_sudo_for_group_input(user_id):
@@ -85,26 +87,202 @@ async def handle_role_switch(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @require_sudo
 async def manual_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("⏳ در حال تهیه بکاپ کامل... لطفاً صبر کنید.")
+    """Show backup type selection: Data Export or Full Backup"""
+    keyboard = [
+        [InlineKeyboardButton("📊 خروجی اطلاعات (CSV)", callback_data="backup_csv")],
+        [InlineKeyboardButton("💾 بکاپ کامل (ZIP)", callback_data="backup_zip")],
+    ]
+    await update.message.reply_text(
+        "💾 تهیه بکاپ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "نوع خروجی مورد نظر را انتخاب کنید:\n\n"
+        "📊 خروجی اطلاعات: فایل CSV با اطلاعات طرح‌ها\n"
+        "💾 بکاپ کامل: فایل ZIP شامل دیتابیس و فایل‌ها",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    zip_path = await BackupService.create_daily_backup_zip()
 
-    if not zip_path:
-        await msg.edit_text("❌ خطایی در گرفتن بکاپ رخ داد.")
+@require_sudo
+async def backup_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle backup type selection callbacks"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "backup_csv":
+        keyboard = [
+            [InlineKeyboardButton("📅 هفته اخیر", callback_data="csv_week")],
+            [InlineKeyboardButton("📅 ماه اخیر", callback_data="csv_month")],
+            [InlineKeyboardButton("📅 کل اطلاعات", callback_data="csv_all")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="csv_cancel")],
+        ]
+        await query.edit_message_text(
+            "📊 خروجی اطلاعات (CSV)\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "بازه زمانی مورد نظر را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif query.data == "backup_zip":
+        await query.edit_message_text("⏳ در حال تهیه بکاپ کامل... لطفاً صبر کنید.")
+
+        zip_path = await BackupService.create_daily_backup_zip()
+
+        if not zip_path:
+            await query.edit_message_text("❌ خطایی در گرفتن بکاپ رخ داد.")
+            return
+
+        try:
+            file_size = os.path.getsize(zip_path) / 1024
+            with open(zip_path, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=SUDO_USER_ID,
+                    document=f,
+                    filename=os.path.basename(zip_path),
+                    caption=f"💾 بکاپ کامل\nحجم: {file_size:.1f} KB"
+                )
+            await query.delete_message()
+        finally:
+            shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
+
+
+@require_sudo
+async def csv_range_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle CSV time range selection"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "csv_cancel":
+        await query.edit_message_text("❌ عملیات لغو شد.")
+        return
+
+    time_range = query.data.replace("csv_", "")
+
+    range_labels = {
+        'week': 'هفته اخیر',
+        'month': 'ماه اخیر',
+        'all': 'کل اطلاعات'
+    }
+
+    await query.edit_message_text(
+        f"⏳ در حال تهیه خروجی {range_labels[time_range]}..."
+    )
+
+    loop = asyncio.get_event_loop()
+    csv_path = await loop.run_in_executor(
+        None, BackupService.create_csv_export, time_range
+    )
+
+    if not csv_path:
+        await query.edit_message_text("❌ خطا در تهیه خروجی. ممکن است داده‌ای موجود نباشد.")
         return
 
     try:
-        file_size = os.path.getsize(zip_path) / 1024
-        with open(zip_path, 'rb') as f:
+        file_size = os.path.getsize(csv_path) / 1024
+
+        with open(csv_path, 'rb') as f:
             await context.bot.send_document(
                 chat_id=SUDO_USER_ID,
                 document=f,
-                filename=os.path.basename(zip_path),
-                caption=f"💾 بکاپ دستی\nحجم: {file_size:.1f} KB"
+                filename=os.path.basename(csv_path),
+                caption=(
+                    f"📊 خروجی اطلاعات — {range_labels[time_range]}\n"
+                    f"حجم: {file_size:.1f} KB"
+                )
             )
-        await msg.delete()
+        await query.delete_message()
+    except Exception as e:
+        logging.error(f"Failed to send CSV: {e}")
+        await query.edit_message_text(f"❌ خطا در ارسال فایل: {e}")
     finally:
-        shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
+        shutil.rmtree(os.path.dirname(csv_path), ignore_errors=True)
+
+
+@require_sudo
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask user to send the backup ZIP file for restore"""
+    context.user_data['awaiting_restore_file'] = True
+    await update.message.reply_text(
+        "🔧 ریستور از بکاپ\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "فایل ZIP بکاپ را ارسال کنید.\n\n"
+        "⚠️ این عملیات:\n"
+        "• دیتابیس فعلی را با بکاپ جایگزین می‌کند\n"
+        "• فایل‌های پوشه public را بازنویسی می‌کند\n"
+        "• ربات ریستارت می‌شود\n\n"
+        "برای لغو /cancel بزنید."
+    )
+
+
+async def confirm_restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle restore confirmation buttons"""
+    query = update.callback_query
+    await query.answer()
+
+    # Only sudo can confirm
+    if query.from_user.id != SUDO_USER_ID:
+        await query.answer("🚫 فقط Sudo", show_alert=True)
+        return
+
+    if query.data == "cancel_restore":
+        context.user_data.pop('restore_pending', None)
+        await query.edit_message_text("❌ ریستور لغو شد.")
+        return
+
+    if query.data == "confirm_restore":
+        pending = context.user_data.pop('restore_pending', None)
+        if not pending:
+            await query.edit_message_text("❌ اطلاعات ریستور یافت نشد. دوباره تلاش کنید.")
+            return
+
+        await query.edit_message_text("⏳ در حال ریستور دیتابیس...")
+
+        from services.restore_service import RestoreService
+
+        # Step 1: Restore database
+        try:
+            db_result = RestoreService.restore_database(pending['sql_path'])
+            if not db_result['success']:
+                await query.edit_message_text(
+                    f"❌ خطا در ریستور دیتابیس:\n{db_result['error'][:300]}"
+                )
+                shutil.rmtree(pending['temp_dir'], ignore_errors=True)
+                return
+        except Exception as e:
+            await query.edit_message_text(f"❌ خطا در ریستور دیتابیس:\n{str(e)[:300]}")
+            shutil.rmtree(pending['temp_dir'], ignore_errors=True)
+            return
+
+        # Step 2: Restore public files
+        await query.edit_message_text("⏳ در حال بازنویسی فایل‌های public...")
+        try:
+            files_result = RestoreService.restore_public_files(pending['zip_path'])
+        except Exception as e:
+            files_result = {'success': False, 'error': str(e)}
+
+        # Step 3: Cleanup temp files
+        shutil.rmtree(pending['temp_dir'], ignore_errors=True)
+
+        # Step 4: Report result
+        msg_lines = [
+            "✅ ریستور با موفقیت انجام شد",
+            "━━━━━━━━━━━━━━━━━━",
+            f"📦 دیتابیس: بازیابی شد",
+        ]
+        if files_result['success']:
+            msg_lines.append(
+                f"📁 فایل‌ها: {files_result.get('files_restored', 0)} فایل بازنویسی شد"
+            )
+        else:
+            msg_lines.append(f"📁 فایل‌ها: خطا — {files_result.get('error', 'نامشخص')[:100]}")
+
+        await query.edit_message_text('\n'.join(msg_lines))
+
+        # Step 5: Restart bot
+        await context.bot.send_message(
+            chat_id=SUDO_USER_ID,
+            text="🔄 ربات در حال ریستارت برای اعمال تغییرات..."
+        )
+        RestoreService.restart_bot()
 
 
 @require_sudo
@@ -135,21 +313,47 @@ async def execute_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+
+        if proc.returncode != 0:
+            error_detail = (stderr or stdout or b"unknown error").decode(errors="replace").strip()
+            logging.error(f"Restart failed (rc={proc.returncode}): {error_detail}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"❌ ریستارت ناموفق بود:\n<pre>{html.escape(error_detail[:500])}</pre>",
+                parse_mode="HTML"
+            )
+    except FileNotFoundError:
+        logging.error("supervisorctl not found — check SUPERVISORD_CONF path")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ دستور supervisorctl یافت نشد. مسیر SUPERVISORD_CONF را بررسی کنید."
+        )
+    except asyncio.TimeoutError:
+        logging.error("Restart command timed out after 30s")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ ریستارت بیش از 30 ثانیه طول کشید. ممکن است ربات هنگ کرده باشد."
+        )
     except Exception as e:
         logging.error(f"Restart failed: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ خطای غیرمنتظره: {html.escape(str(e)[:300])}"
+        )
 
 
 @require_sudo
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        import subprocess
-        result = subprocess.run(
-            ['supervisorctl', '-c', SUPERVISORD_CONF, 'status', SUPERVISOR_PROCESS],
-            capture_output=True, text=True, check=True, timeout=10
+        proc = await asyncio.create_subprocess_exec(
+            'supervisorctl', '-c', SUPERVISORD_CONF, 'status', SUPERVISOR_PROCESS,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
         await update.message.reply_text(
-            f"📊 وضعیت ربات:\n\n{result.stdout.strip()}\n\n"
+            f"📊 وضعیت ربات:\n\n{stdout.decode().strip()}\n\n"
             f"🕐 زمان: {get_tehran_time().strftime('%Y-%m-%d %H:%M:%S')}"
         )
     except Exception as e:
@@ -161,11 +365,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def broadcast_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    
-    if query.from_user.id != SUDO_USER_ID:
-        await query.answer("🚫 فقط Sudo!", show_alert=True)
-        return
-        
+
     users = User.get_all_active()
     sent_count = 0
     
@@ -395,7 +595,16 @@ async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+def _kill_key(update, context) -> str:
+    """Lock key for delete confirmation — prevents double-tap"""
+    data: str = update.callback_query.data
+    if data == "cancel_kill":
+        return "cancel_kill"
+    code: str = data.replace("confirm_kill_", "")
+    return f"kill_{code}"
+
 @require_sudo
+@deduplicate_callback(_kill_key)
 async def confirm_delete_design_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle design deletion confirmation"""
     query = update.callback_query

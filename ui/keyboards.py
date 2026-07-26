@@ -13,8 +13,8 @@ class Keyboards:
         keyboard = []
         privileged = User.is_privileged_user(user.user_id)
 
-        # Design submission buttons — editors and sudo
-        if role in ['sudo', 'editor']:
+        # Design submission buttons — editors only
+        if role == 'editor':
             row = []
             for pl in product_lines:
                 row.append(KeyboardButton(f"➕ {pl.icon} ثبت {pl.name_fa}"))
@@ -23,6 +23,12 @@ class Keyboards:
                     row = []
             if row:
                 keyboard.append(row)
+
+            # My designs button for editors
+            keyboard.append([KeyboardButton("📋 طرح‌های من")])
+
+            # Reset stats for editors
+            keyboard.append([KeyboardButton("🔄 بازنشانی آمار")])
 
         # Per-line stats — everyone
         row = []
@@ -34,15 +40,15 @@ class Keyboards:
         if row:
             keyboard.append(row)
 
-        # Pending + overall stats — reviewers and sudo
-        if role in ['sudo', 'reviewer']:
-            if privileged:
-                keyboard.append([
-                    KeyboardButton("📋 طرح‌های در انتظار"),
-                    KeyboardButton("📊 آمار کلی")
-                ])
-            else:
-                keyboard.append([KeyboardButton("📋 طرح‌های در انتظار")])
+        # Pending + overall stats — reviewers only
+        if role == 'reviewer':
+            keyboard.append([KeyboardButton("📋 طرح‌های در انتظار")])
+        if privileged:
+            keyboard.append([KeyboardButton("📊 آمار کلی")])
+
+        # Advanced search — reviewers, sudo and Nazi only
+        if role in ['sudo', 'reviewer'] or privileged:
+            keyboard.append([KeyboardButton("🔍 جستجوی پیشرفته")])
 
         # Design management — privileged only (sudo + nazi)
         if privileged:
@@ -55,7 +61,8 @@ class Keyboards:
         if user.is_sudo:
             keyboard.append([
                 KeyboardButton("👑 تغییر نقش"),
-                KeyboardButton("💾 بکاپ")
+                KeyboardButton("💾 بکاپ"),
+                KeyboardButton("🔧 ریستور")
             ])
             keyboard.append([
                 KeyboardButton("🔄 ریستارت"),
@@ -63,6 +70,7 @@ class Keyboards:
             ])
             keyboard.append([
                 KeyboardButton("📊 وضعیت"),
+                KeyboardButton("🔄 بازنشانی آمار"),
                 KeyboardButton("📖 راهنما")
             ])
 
@@ -194,20 +202,20 @@ class Keyboards:
             ],
         ]
 
-        # Clear buttons — only show if files exist
-        clear_row = []
+        # Management buttons — only show if files exist
+        manage_row = []
         if mockup_count > 0:
-            clear_row.append(InlineKeyboardButton(
-                "🗑 پاکسازی موکاپ‌ها",
-                callback_data="workspace_clear_mockup"
+            manage_row.append(InlineKeyboardButton(
+                "📁 مدیریت موکاپ‌ها",
+                callback_data="manage_mockups"
             ))
         if print_count > 0:
-            clear_row.append(InlineKeyboardButton(
-                "🗑 پاکسازی فایل چاپی",
-                callback_data="workspace_clear_print"
+            manage_row.append(InlineKeyboardButton(
+                "📁 مدیریت فایل چاپی",
+                callback_data="manage_prints"
             ))
-        if clear_row:
-            buttons.append(clear_row)
+        if manage_row:
+            buttons.append(manage_row)
 
         buttons.append([
             InlineKeyboardButton(
@@ -288,5 +296,61 @@ class Keyboards:
                 callback_data=f"clear_cancelled_{stage}"
             ),
         ]]
+
+        return text, InlineKeyboardMarkup(buttons)
+
+
+    @staticmethod
+    def get_manage_files_stage(
+        stage: str,
+        files: list,
+        code: str,
+        product_name: str
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        """Management view for individual file removal"""
+
+        stage_label = "موکاپ‌ها" if stage == "mockup" else "فایل‌های چاپی"
+        stage_emoji = "🎨" if stage == "mockup" else "🖨"
+
+        text = (
+            f"📁 مدیریت {stage_label} — *{code}*\n"
+            f"━━━━━━━━━━━━━━━━\n"
+        )
+
+        if not files:
+            text += f"\nهیچ {stage_label[:-1]}ی ثبت نشده.\n"
+        else:
+            for i in range(len(files)):
+                text += f"{i+1}️⃣ {stage_emoji} {stage_label[:-1]} {i+1}\n"
+
+        text += f"\n━━━━━━━━━━━━━━━━"
+
+        buttons = []
+
+        # Individual remove buttons (2 per row)
+        if files:
+            row = []
+            for i in range(len(files)):
+                row.append(InlineKeyboardButton(
+                    f"❌ {i+1}",
+                    callback_data=f"remove_{stage}_{i}"
+                ))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+
+            # Clear all button
+            buttons.append([InlineKeyboardButton(
+                f"🗑 حذف همه {stage_label}",
+                callback_data=f"manage_clear_{stage}"
+            )])
+
+        # Back button
+        buttons.append([InlineKeyboardButton(
+            "🔙 بازگشت",
+            callback_data="manage_back"
+        )])
 
         return text, InlineKeyboardMarkup(buttons)

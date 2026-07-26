@@ -2,6 +2,7 @@ import pymysql
 import json
 import logging
 import time
+import uuid
 from typing import Optional
 from config.database import get_db_connection
 from utils.helpers import get_tehran_time, to_utc_naive
@@ -30,6 +31,7 @@ class Design:
         metadata=None,
         product_name: Optional[str] = None,
         product_icon: Optional[str] = None,
+        file_types: Optional[dict] = None,
         **kwargs
     ):
         self.id = id
@@ -49,6 +51,8 @@ class Design:
         self.metadata = metadata
         self.product_name = product_name
         self.product_icon = product_icon
+        # Store file types: {file_id: 'photo'|'document'}
+        self.file_types = file_types or {}
 
         if kwargs:
             logging.warning(f"Design.__init__ received unknown kwargs: {list(kwargs.keys())}")
@@ -114,6 +118,21 @@ class Design:
             except ValueError:
                 continue
 
+    def can_be_edited_by(self, user_id: int) -> bool:
+        """
+        Check if this design can be edited by the given user.
+
+        Args:
+            user_id: User ID attempting to edit
+
+        Returns:
+            True if design is pending and user is the owner
+        """
+        return (
+            self.status == DesignStatus.PENDING and
+            self.editor_user_id == user_id
+        )
+
 
     @staticmethod
     def _parse_row(row: dict) -> dict:
@@ -145,6 +164,13 @@ class Design:
         except (json.JSONDecodeError, TypeError) as e:
             logging.error(f"Invalid JSON in mockup_message_ids_reviewer for design {row.get('code')}: {e}")
             row['mockup_message_ids_reviewer'] = {}
+
+        # file_types
+        try:
+            row['file_types'] = json.loads(row['file_types']) if row.get('file_types') else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"Invalid JSON in file_types for design {row.get('code')}: {e}")
+            row['file_types'] = {}
 
         return row
 
@@ -196,6 +222,12 @@ class Design:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            logging.info(
+                f"[DESIGN] save START | code={self.code} | id={self.id} | "
+                f"status={self.status} | mockup_files={len(self.mockup_file_ids)} | "
+                f"print_files={len(self.print_file_ids)}"
+            )
+
             try:
                 mockup_json = json.dumps(self.mockup_file_ids, ensure_ascii=False)
             except (TypeError, ValueError) as e:
@@ -216,37 +248,59 @@ class Design:
                 logging.error(f"Failed to serialize mockup_message_ids_reviewer: {e}")
                 reviewer_msgs_json = None
 
+            try:
+                file_types_json = json.dumps(self.file_types, ensure_ascii=False) if self.file_types else '{}'
+            except (TypeError, ValueError) as e:
+                logging.error(f"Failed to serialize file_types: {e}")
+                file_types_json = '{}'
+
             if self.id:
+                logging.info(
+                    f"[DESIGN] save UPDATE branch | code={self.code} | id={self.id}"
+                )
                 cursor.execute("""
                     UPDATE designs
                     SET mockup_file_ids = %s,
                         print_file_ids = %s,
                         mockup_message_ids_reviewer = %s,
+                        file_types = %s,
                         status = %s,
                         reviewer_user_id = %s,
                         reviewer_name = %s,
                         reviewed_at = %s,
                         final_name = %s
                     WHERE id = %s
-                """, (mockup_json, print_json, reviewer_msgs_json,
+                """, (mockup_json, print_json, reviewer_msgs_json, file_types_json,
                       self.status.value, self.reviewer_user_id, self.reviewer_name,
                       self.reviewed_at, self.final_name, self.id))
             else:
+                logging.info(
+                    f"[DESIGN] save INSERT branch | code={self.code}"
+                )
                 now_utc = to_utc_naive(get_tehran_time())
                 cursor.execute("""
                     INSERT INTO designs
                     (code, product_line_id, status, editor_user_id, editor_name,
-                     mockup_file_ids, print_file_ids, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     mockup_file_ids, print_file_ids, file_types, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (self.code, self.product_line_id, self.status.value,
                       self.editor_user_id, self.editor_name,
-                      mockup_json, print_json, now_utc))
+                      mockup_json, print_json, file_types_json, now_utc))
                 self.id = cursor.lastrowid
+                logging.info(
+                    f"[DESIGN] save INSERT DONE | code={self.code} | new_id={self.id}"
+                )
 
             conn.commit()
+            logging.info(
+                f"[DESIGN] save DONE | code={self.code} | id={self.id} | "
+                f"rows_affected={cursor.rowcount}"
+            )
         except Exception as e:
             conn.rollback()
-            logging.error(f"Failed to save design {self.code}: {e}")
+            logging.exception(
+                f"[DESIGN] save FAILED | code={self.code} | error={e}"
+            )
             raise
         finally:
             cursor.close()
@@ -256,6 +310,12 @@ class Design:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            logging.info(
+                f"[DESIGN] approve START | code={self.code} | id={self.id} | "
+                f"reviewer={reviewer_name}({reviewer_user_id})"
+            )
+
+            conn.begin()
             cursor.execute("""
                 UPDATE designs
                 SET status = %s,
@@ -267,21 +327,48 @@ class Design:
                   to_utc_naive(get_tehran_time()), self.id, DesignStatus.PENDING))
 
             affected = cursor.rowcount
-            conn.commit()
+            logging.info(
+                f"[DESIGN] approve UPDATE result | code={self.code} | "
+                f"affected_rows={affected}"
+            )
 
             if affected == 0:
+                conn.rollback()
+                logging.warning(
+                    f"[DESIGN] approve LOST RACE | code={self.code} | "
+                    f"affected=0 — another reviewer already processed"
+                )
                 return False
+
+            now_utc = to_utc_naive(get_tehran_time())
+            cursor.execute("""
+                INSERT INTO designs_locked_codes
+                (code, product_line_id, locked_at, is_manual)
+                VALUES (%s, %s, %s, FALSE)
+                ON DUPLICATE KEY UPDATE locked_at = %s
+            """, (self.code, self.product_line_id, now_utc, now_utc))
+
+            logging.info(
+                f"[DESIGN] approve LOCK INSERT | code={self.code} | "
+                f"product_line_id={self.product_line_id}"
+            )
+
+            conn.commit()
 
             self.status = DesignStatus.APPROVED
             self.reviewer_user_id = reviewer_user_id
             self.reviewer_name = reviewer_name
-            self.lock_code()
-            logging.info(f"✅ Design {self.code} approved by {reviewer_name}")
+            logging.info(
+                f"[DESIGN] approve DONE | code={self.code} | "
+                f"reviewer={reviewer_name} | status=APPROVED"
+            )
             return True
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"Failed to approve design {self.code}: {e}")
+            logging.exception(
+                f"[DESIGN] approve FAILED | code={self.code} | error={e}"
+            )
             raise
         finally:
             cursor.close()
@@ -291,7 +378,8 @@ class Design:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            rej_code = f"{self.code}_REJ_{int(time.time())}"
+            rej_code = f"{self.code}_REJ_{uuid.uuid4().hex[:8]}"
+            conn.begin()
             cursor.execute("""
                 UPDATE designs
                 SET status = %s,
@@ -336,7 +424,9 @@ class Design:
             """, (self.code, self.product_line_id, now_utc, now_utc))
             conn.commit()
         except Exception as e:
+            conn.rollback()
             logging.error(f"Failed to lock code {self.code}: {e}")
+            raise
         finally:
             cursor.close()
             conn.close()

@@ -22,6 +22,7 @@ class User:
         added_at=None,
         last_active=None,
         metadata=None,
+        stats_reset_at=None,
         **kwargs
     ):
         self.user_id = user_id
@@ -36,6 +37,7 @@ class User:
         self.added_at = added_at
         self.last_active = last_active
         self.metadata = metadata
+        self.stats_reset_at = stats_reset_at
 
         if kwargs:
             logging.warning(f"User.__init__ received unknown kwargs: {list(kwargs.keys())}")

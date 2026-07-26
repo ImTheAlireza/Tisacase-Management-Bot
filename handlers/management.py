@@ -27,18 +27,6 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(str(e))
         return
 
-    try:
-        user_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id باید عدد باشد.")
-        return
-
-    role = args[1].lower()
-    if role not in ('editor', 'reviewer'):
-        await update.message.reply_text("❌ نقش باید editor یا reviewer باشد.")
-        return
-
-    first_name = ' '.join(args[2:])
     sudo_user = context.user_data['db_user']
 
     existing = User.get_by_id(user_id)
@@ -103,12 +91,6 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_id = Validators.validate_user_id(args[0])
     except ValidationError as e:
         await update.message.reply_text(str(e))
-        return
-
-    try:
-        user_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id باید عدد باشد.")
         return
 
     sudo_user = context.user_data['db_user']
@@ -181,17 +163,6 @@ async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         new_role = Validators.validate_role(args[1])
     except ValidationError as e:
         await update.message.reply_text(str(e))
-        return
-
-    try:
-        user_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id باید عدد باشد.")
-        return
-
-    new_role = args[1].lower()
-    if new_role not in ('editor', 'reviewer'):
-        await update.message.reply_text("❌ نقش باید editor یا reviewer باشد. (sudo قابل تغییر نیست)")
         return
 
     user = User.get_by_id(user_id)
@@ -272,10 +243,6 @@ async def add_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValidationError as e:
         await update.message.reply_text(str(e))
         return
-
-    prefix = args[0].upper()
-    icon = args[-1]
-    name_fa = ' '.join(args[1:-1])
 
     if not name_fa:
         await update.message.reply_text("❌ نام فارسی را وارد کنید.")
@@ -360,6 +327,93 @@ async def enable_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+@require_sudo
+async def delete_line_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /deleteline {prefix}
+    Delete a product line permanently IF no approved designs exist.
+    If it has approved designs, it can only be deactivated.
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "استفاده: /deleteline {prefix}\n"
+            "مثال: /deleteline STI\n\n"
+            "⚠️ فقط خطوطی قابل حذف هستند که هیچ طرح تایید شده‌ای نداشته باشند."
+        )
+        return
+
+    prefix = args[0].upper()
+
+    # Need to find line even if inactive
+    lines = ProductLine.get_all()
+    pl = next((l for l in lines if l.code_prefix == prefix), None)
+
+    if not pl:
+        await update.message.reply_text(f"❌ خط تولید '{prefix}' یافت نشد.")
+        return
+
+    if pl.has_approved_designs():
+        await update.message.reply_text(
+            f"❌ خط تولید {pl.icon} {pl.name_fa} ({prefix}) دارای طرح‌های تایید شده است.\n\n"
+            f"این خط فقط قابل غیرفعال کردن است:\n"
+            f"/disableline {prefix}"
+        )
+        return
+
+    if pl.has_any_designs():
+        await update.message.reply_text(
+            f"⚠️ خط تولید {pl.icon} {pl.name_fa} ({prefix}) دارای طرح‌هایی است "
+            f"(در انتظار یا رد شده).\n\n"
+            f"آیا مطمئن هستید که می‌خواهید آن را حذف کنید؟\n"
+            f"تمام طرح‌های مرتبط حذف خواهند شد.\n\n"
+            f"برای تایید دوباره ارسال کنید:\n"
+            f"/deleteline {prefix}"
+        )
+        context.user_data['awaiting_delete_line_confirm'] = prefix
+        return
+
+    # No designs at all — safe to delete
+    try:
+        pl.delete()
+        await update.message.reply_text(
+            f"🗑️ خط تولید حذف شد:\n"
+            f"{pl.icon} {pl.name_fa} ({prefix})"
+        )
+    except Exception as e:
+        logging.error(f"Failed to delete product line {prefix}: {e}")
+        await update.message.reply_text(f"❌ خطا در حذف خط تولید: {e}")
+
+
+async def _execute_delete_line(update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str) -> None:
+    """Execute product line deletion after confirmation"""
+    from models.product_line import ProductLine
+
+    lines = ProductLine.get_all()
+    pl = next((l for l in lines if l.code_prefix == prefix), None)
+
+    if not pl:
+        await update.message.reply_text(f"❌ خط تولید '{prefix}' یافت نشد.")
+        return
+
+    if pl.has_approved_designs():
+        await update.message.reply_text(
+            f"❌ خط تولید {pl.icon} {pl.name_fa} ({prefix}) "
+            f"دارای طرح‌های تایید شده است و قابل حذف نیست."
+        )
+        return
+
+    try:
+        pl.delete()
+        await update.message.reply_text(
+            f"🗑️ خط تولید حذف شد:\n"
+            f"{pl.icon} {pl.name_fa} ({prefix})"
+        )
+    except Exception as e:
+        logging.error(f"Failed to delete product line {prefix}: {e}")
+        await update.message.reply_text(f"❌ خطا در حذف خط تولید: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Code management commands
 # ---------------------------------------------------------------------------
@@ -381,9 +435,6 @@ async def lock_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(str(e))
         return
 
-    notes = ' '.join(args[1:]) if len(args) > 1 else None
-
-    code = args[0].upper()
     notes = ' '.join(args[1:]) if len(args) > 1 else None
     sudo_user = context.user_data['db_user']
 

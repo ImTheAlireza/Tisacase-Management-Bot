@@ -98,9 +98,6 @@ def _build_lines_text() -> str:
         appr_str = ", ".join(r['recent_approved']) if r['recent_approved'] else "هیچ"
         rej_str = ", ".join(r['recent_rejected']) if r['recent_rejected'] else "هیچ"
         
-        # FIX: Show deleted count if > 0
-        deleted_line = f"  🗑 حذف شده:  {r['deleted_all']}\n" if r.get('deleted_all', 0) > 0 else ""
-        
         lines.append(
             f"\n{active} {r['icon']} {r['name_fa']} ({r['code_prefix']})\n"
             f"  ⏳ کدهای در انتظار: {pending_str}\n"
@@ -109,7 +106,6 @@ def _build_lines_text() -> str:
             f"  امروز:  ثبت {r['submitted_today']} | تایید {r['approved_today']} | رد {r['rejected_today']}\n"
             f"  هفته:   ثبت {r['submitted_week']} | تایید {r['approved_week']} | رد {r['rejected_week']}\n"
             f"  کل:     ثبت {r['total_all']} | تایید {r['approved_all']} | رد {r['rejected_all']} | انتظار {r['pending_all']}\n"
-            f"{deleted_line}"
         )
     return '\n'.join(lines)
 

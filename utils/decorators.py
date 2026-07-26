@@ -1,14 +1,19 @@
 from functools import wraps
 from typing import Callable
 from models.user import User
+from utils.rate_limiter import rate_limiter
 import logging
 
 
-def require_role(*allowed_roles: str) -> Callable:
+def require_role(*allowed_roles: str, rate_limit_action: str = None) -> Callable:
     """
-    Decorator to check if user has required role.
+    Decorator to check if user has required role and apply rate limiting.
     Fetches a fresh user from DB on every call.
     Sudo always has access regardless of active role.
+
+    Args:
+        allowed_roles: Tuple of allowed role names
+        rate_limit_action: Optional rate limit key (from rate_limiter)
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -32,6 +37,17 @@ def require_role(*allowed_roles: str) -> Callable:
                 elif update.callback_query:
                     await update.callback_query.answer(msg, show_alert=True)
                 return
+
+            # Rate limiting (skip for sudo users)
+            if rate_limit_action and not user.is_sudo:
+                can_proceed, wait_time = rate_limiter.check_rate_limit(user_id, rate_limit_action)
+                if not can_proceed:
+                    msg = f"⏳ لطفاً {wait_time:.1f} ثانیه صبر کنید"
+                    if update.message:
+                        await update.message.reply_text(msg)
+                    elif update.callback_query:
+                        await update.callback_query.answer(msg, show_alert=True)
+                    return
 
             context.user_data['db_user'] = user
             return await func(update, context, *args, **kwargs)

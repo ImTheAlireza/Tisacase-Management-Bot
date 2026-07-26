@@ -39,36 +39,6 @@ DEFAULT_PRODUCT_LINES = [
         'counter_start': 1,
         'counter_end': 999,
         'display_order': 1
-    },
-    {
-        'code_prefix': 'STI',
-        'name_en': 'sticker',
-        'name_fa': 'استیکر',
-        'icon': '🎨',
-        'code_format': 'STI{counter:03d}',
-        'counter_start': 1,
-        'counter_end': 999,
-        'display_order': 2
-    },
-    {
-        'code_prefix': 'TB',
-        'name_en': 'frame',
-        'name_fa': 'قاب تابلو',
-        'icon': '🖼',
-        'code_format': 'TB{counter:03d}',
-        'counter_start': 1,
-        'counter_end': 999,
-        'display_order': 3
-    },
-    {
-        'code_prefix': 'TT',
-        'name_en': 'tshirt',
-        'name_fa': 'تیشرت',
-        'icon': '👕',
-        'code_format': 'TT{counter:03d}',
-        'counter_start': 1,
-        'counter_end': 999,
-        'display_order': 4
     }
 ]
 
@@ -110,6 +80,10 @@ ROLES = {
 BACKUP_TIME_HOUR = 23
 BACKUP_TIME_MINUTE = 59
 
+# ==================== SERVER BILL REMINDER SETTINGS ====================
+SERVER_BILL_REMINDER_HOUR = int(os.getenv('SERVER_BILL_REMINDER_HOUR', '9'))
+SERVER_BILL_REMINDER_MINUTE = int(os.getenv('SERVER_BILL_REMINDER_MINUTE', '0'))
+
 # ==================== FILE SETTINGS ====================
 MAX_FILE_SIZE_MB = 20
 ALLOWED_FILE_TYPES = [
@@ -121,6 +95,20 @@ ALLOWED_FILE_TYPES = [
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
+# ==================== RATE LIMITING ====================
+RATE_LIMIT_FILE_UPLOAD = float(os.getenv('RATE_LIMIT_FILE_UPLOAD', '1.0'))
+RATE_LIMIT_CODE_GEN = float(os.getenv('RATE_LIMIT_CODE_GEN', '3.0'))
+RATE_LIMIT_COMMAND = float(os.getenv('RATE_LIMIT_COMMAND', '0.5'))
+RATE_LIMIT_SUBMIT = float(os.getenv('RATE_LIMIT_SUBMIT', '5.0'))
+RATE_LIMIT_REVIEW = float(os.getenv('RATE_LIMIT_REVIEW', '2.0'))
+
+# ==================== PERFORMANCE ====================
+TELEGRAM_SEND_DELAY = float(os.getenv('TELEGRAM_SEND_DELAY', '0.3'))
+MAX_FILE_SIZE_DOWNLOAD_MB = int(os.getenv('MAX_FILE_SIZE_DOWNLOAD_MB', '20'))
+DB_POOL_MIN_CACHED = int(os.getenv('DB_POOL_MIN_CACHED', '2'))
+DB_POOL_MAX_CACHED = int(os.getenv('DB_POOL_MAX_CACHED', '5'))
+DB_POOL_MAX_CONNECTIONS = int(os.getenv('DB_POOL_MAX_CONNECTIONS', '10'))
+
 # ==================== SUPERVISOR SETTINGS ====================
-SUPERVISORD_CONF = '/home/selfnit4/supervisord.conf'
-SUPERVISOR_PROCESS = 'tisa_bot'
+SUPERVISORD_CONF = os.getenv('SUPERVISORD_CONF', '/etc/supervisor/supervisord.conf')
+SUPERVISOR_PROCESS = os.getenv('SUPERVISOR_PROCESS', 'tisa_bot')

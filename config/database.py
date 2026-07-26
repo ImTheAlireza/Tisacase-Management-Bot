@@ -2,7 +2,7 @@ import pymysql
 import logging
 from pymysql.cursors import DictCursor
 from dbutils.pooled_db import PooledDB
-from config.settings import DB_CONFIG
+from config.settings import DB_CONFIG, DB_POOL_MIN_CACHED, DB_POOL_MAX_CACHED, DB_POOL_MAX_CONNECTIONS
 
 
 _pool: PooledDB | None = None
@@ -14,9 +14,9 @@ def _get_pool() -> PooledDB:
     if _pool is None:
         _pool = PooledDB(
             creator=pymysql,
-            maxconnections=10,
-            mincached=2,
-            maxcached=5,
+            maxconnections=DB_POOL_MAX_CONNECTIONS,
+            mincached=DB_POOL_MIN_CACHED,
+            maxcached=DB_POOL_MAX_CACHED,
             maxshared=0,
             blocking=True,
             ping=1,
@@ -33,9 +33,8 @@ def _get_pool() -> PooledDB:
         )
         logging.info(
             f"✅ Database connection pool initialized "
-            f"(connect_timeout={DB_CONFIG['connect_timeout']}s, "
-            f"read_timeout={DB_CONFIG['read_timeout']}s, "
-            f"write_timeout={DB_CONFIG['write_timeout']}s)"
+            f"(min_cached={DB_POOL_MIN_CACHED}, max_cached={DB_POOL_MAX_CACHED}, "
+            f"max_connections={DB_POOL_MAX_CONNECTIONS})"
         )
     return _pool
 

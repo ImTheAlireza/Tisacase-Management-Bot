@@ -40,6 +40,13 @@ class DesignGroupMessage:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            logging.info(
+                f"[DESIGN_GROUP_MSG] record START | code={code} | "
+                f"design_id={design_id} | group_type={group_type} | "
+                f"chat_id={chat_id} | message_id={message_id} | "
+                f"file_id={str(file_id)[:30]}... | file_index={file_index}"
+            )
+
             now_utc = to_utc_naive(get_tehran_time())
             cursor.execute("""
                 INSERT INTO design_group_messages
@@ -53,9 +60,19 @@ class DesignGroupMessage:
             """, (design_id, code, group_type, chat_id, message_id,
                   file_id, file_index, now_utc))
             conn.commit()
+
+            logging.info(
+                f"[DESIGN_GROUP_MSG] record DONE | code={code} | "
+                f"group_type={group_type} | chat_id={chat_id} | "
+                f"message_id={message_id} | rows_affected={cursor.rowcount}"
+            )
         except Exception as e:
             conn.rollback()
-            logging.error(f"Failed to record group message for {code}: {e}")
+            logging.exception(
+                f"[DESIGN_GROUP_MSG] record FAILED | code={code} | "
+                f"design_id={design_id} | group_type={group_type} | "
+                f"chat_id={chat_id} | message_id={message_id} | error={e}"
+            )
             raise
         finally:
             cursor.close()

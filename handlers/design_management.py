@@ -347,13 +347,32 @@ async def confirm_delete_callback(
     result = await Design.delete_completely(code, context.bot)
 
     if not result['database_deleted']:
+        error_text = (
+            f"❌ خطا در حذف طرح {code}.\n"
+            f"لطفاً با Sudo تماس بگیرید."
+        )
+        if result['errors']:
+            error_text += f"\n\nخطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
+
         await context.bot.send_message(
             chat_id=query.from_user.id,
-            text=(
-                f"❌ خطا در حذف طرح {code}.\n"
-                f"لطفاً با Sudo تماس بگیرید."
-            )
+            text=error_text
         )
+
+        # Notify sudo about the failure
+        from config.settings import SUDO_USER_ID
+        if query.from_user.id != SUDO_USER_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=SUDO_USER_ID,
+                    text=(
+                        f"❌ خطا در حذف طرح {code}\n"
+                        f"درخواست‌کننده: {user.first_name} ({user.user_id})\n\n"
+                        + (f"خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5]) if result['errors'] else "جزئیات خطا موجود نیست.")
+                    )
+                )
+            except Exception:
+                pass
         return
 
     # ✅ Build result message
@@ -364,17 +383,34 @@ async def confirm_delete_callback(
         f"🔓 کد {code} آزاد شد و قابل استفاده مجدد است.",
     ]
 
-    # Show non-fatal errors if any (e.g. messages already deleted)
+    # Show non-fatal errors with details (e.g. messages already deleted)
     if result['errors']:
         result_lines.append(
-            f"\n⚠️ {len(result['errors'])} پیام قابل حذف نبودند "
-            f"(احتمالاً قبلاً حذف شده‌اند)."
+            f"\n⚠️ {len(result['errors'])} خطا رخ داد:\n"
+            + "\n".join(f"• {e}" for e in result['errors'][:5])
         )
 
     await context.bot.send_message(
         chat_id=query.from_user.id,
         text='\n'.join(result_lines)
     )
+
+    # Notify sudo about errors (non-fatal)
+    if result['errors']:
+        from config.settings import SUDO_USER_ID
+        if query.from_user.id != SUDO_USER_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=SUDO_USER_ID,
+                    text=(
+                        f"⚠️ حذف طرح {code} با خطا انجام شد\n"
+                        f"درخواست‌کننده: {user.first_name} ({user.user_id})\n"
+                        f"پیام‌های حذف شده: {result['group_messages_deleted']}\n\n"
+                        f"خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
+                    )
+                )
+            except Exception:
+                pass
 
 
 
