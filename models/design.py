@@ -218,6 +218,38 @@ class Design:
             cursor.close()
             conn.close()
 
+    @staticmethod
+    def get_pending_by_reviewer_message(
+        reviewer_user_id: int,
+        message_id: int
+    ) -> Optional['Design']:
+        """
+        Find a pending design whose reviewer mockup messages contain message_id.
+
+        Used when completing the two-step reject flow from a reply. The stored
+        reviewer message list may also include the action-button message, so only
+        the first N ids (N = mockup count) are considered valid reply targets.
+        """
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        try:
+            cursor.execute("""
+                SELECT * FROM designs
+                WHERE status = %s
+                  AND mockup_message_ids_reviewer IS NOT NULL
+                ORDER BY created_at ASC
+            """, (DesignStatus.PENDING,))
+            for row in cursor.fetchall():
+                design = Design(**Design._parse_row(row))
+                msg_ids = design.get_reviewer_messages(reviewer_user_id)
+                mockup_msg_ids = msg_ids[:len(design.mockup_file_ids)]
+                if str(message_id) in {str(mid) for mid in mockup_msg_ids}:
+                    return design
+            return None
+        finally:
+            cursor.close()
+            conn.close()
+
     def save(self) -> None:
         conn = get_db_connection()
         cursor = conn.cursor()

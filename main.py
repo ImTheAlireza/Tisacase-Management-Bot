@@ -46,7 +46,7 @@ from handlers.sudo import (
 from handlers.reset_stats import reset_stats_command, reset_stats_callback
 from handlers.stats import stats_command, stats_callback
 from handlers.editor import start_new_design, handle_files, editor_callbacks
-from handlers.reviewer import review_callback
+from handlers.reviewer import review_callback, handle_reject_reason_reply
 from handlers.help import help_command, help_callback
 from handlers.search import (
     search_command, search_filter_callback, search_back_callback,
@@ -145,6 +145,12 @@ def run_db_migrations():
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # -----------------------------------------------------------------------
+    # Priority 0 — awaiting reject reason reply
+    # -----------------------------------------------------------------------
+    if await handle_reject_reason_reply(update, context):
+        return
 
     # -----------------------------------------------------------------------
     # Priority 1 — awaiting group input
