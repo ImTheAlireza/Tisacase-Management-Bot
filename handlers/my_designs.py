@@ -181,27 +181,30 @@ async def my_designs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _show_my_designs(update, context, query.from_user.id)
 
     elif data.startswith("mydesigns_view_"):
-        code = data.replace("mydesigns_view_", "")
+        code = data[len("mydesigns_view_"):]
         await _show_design_detail(update, context, code)
 
     elif data.startswith("mydesigns_edit_"):
-        code = data.replace("mydesigns_edit_", "")
+        code = data[len("mydesigns_edit_"):]
         await _start_edit_design(update, context, code)
 
-    elif data.startswith("mydesigns_delete_"):
-        code = data.replace("mydesigns_delete_", "")
-        await _confirm_delete_design(update, context, code)
-
+    # ⚠️ ORDER MATTERS: "mydesigns_delete_confirm_" must be checked BEFORE
+    # "mydesigns_delete_", otherwise the shorter prefix swallows the confirm
+    # callback and the delete button silently does nothing.
     elif data.startswith("mydesigns_delete_confirm_"):
-        code = data.replace("mydesigns_delete_confirm_", "")
+        code = data[len("mydesigns_delete_confirm_"):]
         await _execute_delete_design(update, context, code)
 
+    elif data.startswith("mydesigns_delete_"):
+        code = data[len("mydesigns_delete_"):]
+        await _confirm_delete_design(update, context, code)
+
     elif data.startswith("mydesigns_files_"):
-        code = data.replace("mydesigns_files_", "")
+        code = data[len("mydesigns_files_"):]
         await _send_design_files(update, context, code)
 
     elif data.startswith("mydesigns_resubmit_"):
-        code = data.replace("mydesigns_resubmit_", "")
+        code = data[len("mydesigns_resubmit_"):]
         await _handle_resubmit(update, context, code)
 
     elif data == "mydesigns_back":
