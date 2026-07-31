@@ -40,9 +40,10 @@ async def cancel_command(
     from handlers.editor import _clear_editor_state
     from models.design import Design
 
-    # If editor session is active, delete the pending design
+    # If editor session is active, delete the pending design ONLY IF not editing an existing design
     code = context.user_data.get('code')
-    if code:
+    is_editing = context.user_data.get('editing_existing', False)
+    if code and not is_editing:
         design = Design.get_by_code(code)
         if design:
             try:
@@ -53,6 +54,11 @@ async def cancel_command(
     _clear_editor_state(context)
     context.user_data.clear()
 
-    await update.message.reply_text(
-        "❌ عملیات لغو شد. به منوی اصلی بازگشتید."
-    )
+    if is_editing:
+        await update.message.reply_text(
+            "❌ ویرایش لغو شد. طرح در دیتابیس حفظ شد."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ عملیات لغو شد. به منوی اصلی بازگشتید."
+        )

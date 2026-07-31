@@ -75,9 +75,10 @@ async def _handle_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     user_data = app.user_data.get(chat_id, {})
     code = user_data.get('code')
     workspace_msg_id = user_data.get('workspace_message_id')
+    is_editing = user_data.get('editing_existing', False)
 
-    # ✅ 1. Delete pending design from DB (this frees the code)
-    if code:
+    # ✅ 1. Delete pending design from DB (this frees the code) ONLY if not editing an existing design
+    if code and not is_editing:
         try:
             from models.design import Design
             design = Design.get_by_code(code)
@@ -99,13 +100,17 @@ async def _handle_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ✅ 3. Notify user
     try:
+        msg_text = (
+            " جلسه ویرایش طرح به دلیل عدم فعالیت بسته شد.\n"
+            "طرح قبلی در دیتابیس حفظ شد ✅"
+        ) if is_editing else (
+            " جلسه ثبت طرح به دلیل عدم فعالیت بسته شد.\n"
+            "کد آزاد شد ✅\n"
+            "در صورت نیاز دوباره ثبت را شروع کنید."
+        )
         await context.bot.send_message(
             chat_id=chat_id,
-            text=(
-                " جلسه ثبت طرح به دلیل عدم فعالیت بسته شد.\n"
-                "کد آزاد شد ✅\n"
-                "در صورت نیاز دوباره ثبت را شروع کنید."
-            )
+            text=msg_text
         )
     except Exception as e:
         logging.warning(f"Could not send timeout notice to {chat_id}: {e}")
@@ -128,6 +133,7 @@ def _get_stage_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
         'mockup_files':         context.user_data.get('mockup_files', []),
         'print_files':          context.user_data.get('print_files', []),
         'workspace_message_id': context.user_data.get('workspace_message_id'),
+        'editing_existing':     context.user_data.get('editing_existing', False),
     }
 
 
@@ -158,19 +164,20 @@ async def _render_stage(
     prints       = state['print_files']
     stage        = state['stage']
     msg_id       = state['workspace_message_id']
+    is_edit      = state['editing_existing']
 
     # Build text + markup based on stage
     if stage == EditorStage.MOCKUP:
-        text, markup = Keyboards.get_mockup_stage(code, product_name, len(mockups))
+        text, markup = Keyboards.get_mockup_stage(code, product_name, len(mockups), is_edit=is_edit)
 
     elif stage == EditorStage.PRINT:
-        text, markup = Keyboards.get_print_stage(code, product_name, len(mockups), len(prints))
+        text, markup = Keyboards.get_print_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
 
     elif stage == EditorStage.WORKSPACE:
-        text, markup = Keyboards.get_workspace_stage(code, product_name, len(mockups), len(prints))
+        text, markup = Keyboards.get_workspace_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
 
     elif stage == EditorStage.CONFIRM:
-        text, markup = Keyboards.get_confirm_stage(code, product_name, len(mockups), len(prints))
+        text, markup = Keyboards.get_confirm_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
 
     else:
         return
@@ -245,7 +252,8 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         design.code,
         product_line.name_fa,
         len(design.mockup_file_ids),
-        len(design.print_file_ids)
+        len(design.print_file_ids),
+        is_edit=True
     )
 
     try:
@@ -290,15 +298,17 @@ async def start_new_design(
 
     # ========== CLEANUP EXISTING SESSION ==========
     old_code = context.user_data.get('code')
+    was_editing = context.user_data.get('editing_existing', False)
     if old_code:
-        # Delete the incomplete design from database
-        old_design = Design.get_by_code(old_code)
-        if old_design and old_design.status == DesignStatus.PENDING:
-            try:
-                old_design.delete()
-                logging.info(f"Deleted abandoned design {old_code} for user {user_id}")
-            except Exception as e:
-                logging.error(f"Failed to delete abandoned design {old_code}: {e}")
+        # Delete the incomplete design from database ONLY if it wasn't an existing design being edited
+        if not was_editing:
+            old_design = Design.get_by_code(old_code)
+            if old_design and old_design.status == DesignStatus.PENDING:
+                try:
+                    old_design.delete()
+                    logging.info(f"Deleted abandoned design {old_code} for user {user_id}")
+                except Exception as e:
+                    logging.error(f"Failed to delete abandoned design {old_code}: {e}")
         
         # Delete workspace message
         old_workspace_msg_id = context.user_data.get('workspace_message_id')
@@ -352,6 +362,7 @@ async def start_new_design(
     context.user_data['stage']        = EditorStage.MOCKUP
     context.user_data['mockup_files'] = []
     context.user_data['print_files']  = []
+    context.user_data['editing_existing'] = False
 
     # Send workspace message
     text, markup = Keyboards.get_mockup_stage(code, product.name_fa, 0)
@@ -545,6 +556,9 @@ async def editor_callbacks(
     elif data == "cancel_submission":
         await _handle_cancel(query, context)
 
+    elif data == "cancel_editing":
+        await _handle_cancel_editing(update, query, context)
+
     # -----------------------------------------------------------------------
     # File management
     # -----------------------------------------------------------------------
@@ -699,7 +713,8 @@ async def _handle_remove_file(query, context, chat_id: int, stage: str, index: i
 async def _notify_reviewers_of_edit(bot, design: Design) -> None:
     """
     After an editor updates a pending design, delete old reviewer messages
-    and resend updated files so reviewers see the latest version.
+    and resend updated mockups so reviewers see the latest version.
+    Note: Print files are not sent to reviewers.
     """
     code = design.code
     product_line = ProductLine.get_by_id(design.product_line_id)
@@ -765,19 +780,6 @@ async def _notify_reviewers_of_edit(bot, design: Design) -> None:
                         new_msg_ids.append(m.message_id)
             except Exception as e:
                 logging.error(f"Failed to resend design {code} to reviewer {reviewer_id}: {e}")
-
-        # Resend print files
-        unique_prints = list(dict.fromkeys(design.print_file_ids))
-        for i, fid in enumerate(unique_prints):
-            try:
-                await bot.send_document(
-                    reviewer_id,
-                    document=fid,
-                    caption=f"🖨 فایل چاپی {i+1}/{len(unique_prints)} — {code}"
-                )
-                await asyncio.sleep(TELEGRAM_SEND_DELAY)
-            except Exception as e:
-                logging.error(f"Failed to resend print {i+1} to reviewer {reviewer_id}: {e}")
 
         # Save new message IDs
         if new_msg_ids:
@@ -856,6 +858,22 @@ async def _handle_cancel(query, context) -> None:
         query,
         f"❌ طرح لغو شد. کد آزاد شد."
     )
+
+
+async def _handle_cancel_editing(
+    update: Update,
+    query,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cancel editing an existing design without deleting it, return to design detail."""
+    code: Optional[str] = context.user_data.get('code')
+    _clear_editor_state(context)
+
+    if code:
+        from handlers.my_designs import _show_design_detail
+        await _show_design_detail(update, context, code)
+    else:
+        await safe_edit_message(query, "❌ ویرایش لغو شد.")
 
 
 # ---------------------------------------------------------------------------

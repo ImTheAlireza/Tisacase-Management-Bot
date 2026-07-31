@@ -1,0 +1,165 @@
+import pytest
+import json
+from unittest.mock import patch, MagicMock, AsyncMock
+from models.design import Design
+from utils.enums import DesignStatus
+from handlers.editor import _notify_reviewers_of_edit
+from handlers.design_management import pending_view_callback
+
+
+def _make_raw_row(**overrides):
+    base = {
+        'id': 1,
+        'code': 'TS001',
+        'product_line_id': 1,
+        'status': 'pending',
+        'editor_user_id': 100,
+        'editor_name': 'Ali',
+        'reviewer_user_id': None,
+        'reviewer_name': None,
+        'mockup_file_ids': json.dumps(['mockup1']),
+        'print_file_ids': json.dumps(['print1', 'print2']),
+        'mockup_message_ids_reviewer': json.dumps({'2001': [10, 11]}),
+        'created_at': None,
+        'reviewed_at': None,
+        'final_name': None,
+        'metadata': None,
+        'product_name': None,
+        'product_icon': None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_design(**overrides) -> Design:
+    row = _make_raw_row(**overrides)
+    return Design(**Design._parse_row(row))
+
+
+@pytest.mark.asyncio
+class TestNotifyReviewersOfEdit:
+
+    @patch('handlers.editor.ProductLine.get_by_id')
+    async def test_does_not_send_print_files_to_reviewer(self, mock_get_pl):
+        mock_pl = MagicMock()
+        mock_pl.icon = '📱'
+        mock_pl.name_fa = 'قاب موبایل'
+        mock_get_pl.return_value = mock_pl
+
+        design = _make_design()
+        design.file_types = {'mockup1': 'photo'}
+        design.set_reviewer_messages = MagicMock()
+        design.save_reviewer_messages = MagicMock()
+
+        bot = MagicMock()
+        bot.delete_message = AsyncMock()
+        bot.send_photo = AsyncMock(return_value=MagicMock(message_id=101))
+        bot.send_document = AsyncMock(return_value=MagicMock(message_id=102))
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=103))
+
+        await _notify_reviewers_of_edit(bot, design)
+
+        # Ensure old messages were deleted
+        assert bot.delete_message.call_count == 2
+        # Ensure mockup photo was sent
+        bot.send_photo.assert_called_once()
+        # Ensure print files were NEVER sent as documents
+        bot.send_document.assert_not_called()
+        # Ensure reviewer message IDs were updated with mockup and button message
+        design.set_reviewer_messages.assert_called_once_with(2001, [101])
+        design.save_reviewer_messages.assert_called_once()
+
+
+@pytest.mark.asyncio
+class TestPendingViewCallback:
+
+    @patch('handlers.design_management.User.get_by_id')
+    @patch('handlers.design_management.Design.get_by_code')
+    @patch('handlers.design_management.ProductLine.get_by_id')
+    async def test_pending_view_does_not_send_print_files(self, mock_pl, mock_get_design, mock_get_user):
+        user = MagicMock()
+        user.is_active = True
+        user.role = 'reviewer'
+        user.is_sudo = False
+        mock_get_user.return_value = user
+
+        design = _make_design()
+        design.set_reviewer_messages = MagicMock()
+        design.save_reviewer_messages = MagicMock()
+        mock_get_design.return_value = design
+
+        mock_pl.return_value = MagicMock(icon='📱', name_fa='قاب موبایل')
+
+        update = MagicMock()
+        query = MagicMock()
+        query.answer = AsyncMock()
+        query.from_user.id = 2001
+        query.data = "pending_view_TS001"
+        update.callback_query = query
+
+        context = MagicMock()
+        context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=301))
+        context.bot.send_photo = AsyncMock(return_value=MagicMock(message_id=302))
+        context.bot.send_document = AsyncMock(return_value=MagicMock(message_id=303))
+
+        await pending_view_callback(update, context)
+
+        # Mockup sent via send_photo
+        context.bot.send_photo.assert_called_once()
+        # Print file should NOT be sent via send_document
+        context.bot.send_document.assert_not_called()
+        # Ensure reviewer message IDs were saved
+        assert design.set_reviewer_messages.call_count >= 1
+
+
+class TestClearEditorState:
+
+    def test_clear_editor_state_removes_editing_existing(self):
+        from utils.state_manager import StateManager
+        user_data = {
+            'code': 'TS001',
+            'stage': 'confirm',
+            'editing_existing': True,
+            'db_user': 'keep_me'
+        }
+        StateManager.clear_editor_state(user_data)
+        assert 'editing_existing' not in user_data
+        assert 'code' not in user_data
+        assert user_data.get('db_user') == 'keep_me'
+
+
+class TestCancelEditing:
+
+    def test_keyboards_use_cancel_editing_when_is_edit_true(self):
+        from ui.keyboards import Keyboards
+        _, markup_new = Keyboards.get_mockup_stage("TS001", "قاب موبایل", 1, is_edit=False)
+        _, markup_edit = Keyboards.get_mockup_stage("TS001", "قاب موبایل", 1, is_edit=True)
+
+        assert markup_new.inline_keyboard[-1][0].callback_data == "cancel_submission"
+        assert markup_new.inline_keyboard[-1][0].text == "❌ لغو طرح"
+
+        assert markup_edit.inline_keyboard[-1][0].callback_data == "cancel_editing"
+        assert markup_edit.inline_keyboard[-1][0].text == "❌ لغو ویرایش"
+
+    @pytest.mark.asyncio
+    @patch('handlers.my_designs._show_design_detail')
+    async def test_handle_cancel_editing_does_not_delete_design(self, mock_show_detail):
+        from handlers.editor import _handle_cancel_editing
+        update = MagicMock()
+        query = MagicMock()
+        context = MagicMock()
+        context.user_data = {'code': 'TS001', 'editing_existing': True}
+
+        with patch('models.design.Design.get_by_code') as mock_get_code:
+            mock_design = MagicMock()
+            mock_get_code.return_value = mock_design
+
+            await _handle_cancel_editing(update, query, context)
+
+            # Design.delete MUST NOT be called!
+            mock_design.delete.assert_not_called()
+            # Must call _show_design_detail to get back to design info
+            mock_show_detail.assert_called_once_with(update, context, 'TS001')
+            # Editor state should be cleared
+            assert 'editing_existing' not in context.user_data
+
