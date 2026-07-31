@@ -352,6 +352,7 @@ async def start_new_design(
     context.user_data['stage']        = EditorStage.MOCKUP
     context.user_data['mockup_files'] = []
     context.user_data['print_files']  = []
+    context.user_data['editing_existing'] = False
 
     # Send workspace message
     text, markup = Keyboards.get_mockup_stage(code, product.name_fa, 0)

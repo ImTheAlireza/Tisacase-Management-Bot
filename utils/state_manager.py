@@ -20,6 +20,7 @@ class StateManager:
         'file_types',
         'workspace_message_id',
         'inactivity_job',
+        'editing_existing',
     ]
 
     # Sudo/admin workflow state keys

@@ -110,3 +110,20 @@ class TestPendingViewCallback:
         context.bot.send_document.assert_not_called()
         # Ensure reviewer message IDs were saved
         assert design.set_reviewer_messages.call_count >= 1
+
+
+class TestClearEditorState:
+
+    def test_clear_editor_state_removes_editing_existing(self):
+        from utils.state_manager import StateManager
+        user_data = {
+            'code': 'TS001',
+            'stage': 'confirm',
+            'editing_existing': True,
+            'db_user': 'keep_me'
+        }
+        StateManager.clear_editor_state(user_data)
+        assert 'editing_existing' not in user_data
+        assert 'code' not in user_data
+        assert user_data.get('db_user') == 'keep_me'
+
