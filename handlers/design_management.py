@@ -482,11 +482,11 @@ async def pending_designs_command(update: Update, context: ContextTypes.DEFAULT_
 
 async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Send mockup + print files when a code button is tapped in pending list.
+    Send mockup files when a code button is tapped in pending list.
 
     ✅ FIXED: Mockup message IDs are now stored in DB per reviewer.
     This allows cleanup of reviewer PV messages after approve/reject.
-    Print file message IDs are NOT stored — only mockups need cleanup.
+    Print files are NOT sent to reviewers.
     """
     query = update.callback_query
     await query.answer()
@@ -522,7 +522,7 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
     pl_name: str = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
 
     # Warn if too many files
-    total_files: int = len(design.mockup_file_ids) + len(set(design.print_file_ids))
+    total_files: int = len(design.mockup_file_ids)
     if total_files > 10:
         await query.answer(
             f"⚠️ این طرح {total_files} فایل دارد. ارسال ممکن است کمی طول بکشد...",
@@ -629,31 +629,3 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             logging.error(
                 f"Could not save button message ID for {code}: {e}"
             )
-
-    # ===========================================================
-    # Send print files
-    # ✅ Print file IDs are NOT tracked — no cleanup needed
-    # ===========================================================
-    unique_prints: list = list(dict.fromkeys(design.print_file_ids))
-    print_count: int = len(unique_prints)
-
-    for i, fid in enumerate(unique_prints):
-        cap: str = f"🖨 فایل چاپی {i+1}/{print_count} — {code}"
-        try:
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=fid,
-                caption=cap
-            )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logging.error(
-                f"Failed to send print {i+1} of {code} "
-                f"to reviewer {user_id}: {e}"
-            )
-
-    # Completion message
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"✅ تمام فایل‌های طرح {code} ارسال شد."
-    )

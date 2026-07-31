@@ -699,7 +699,8 @@ async def _handle_remove_file(query, context, chat_id: int, stage: str, index: i
 async def _notify_reviewers_of_edit(bot, design: Design) -> None:
     """
     After an editor updates a pending design, delete old reviewer messages
-    and resend updated files so reviewers see the latest version.
+    and resend updated mockups so reviewers see the latest version.
+    Note: Print files are not sent to reviewers.
     """
     code = design.code
     product_line = ProductLine.get_by_id(design.product_line_id)
@@ -765,19 +766,6 @@ async def _notify_reviewers_of_edit(bot, design: Design) -> None:
                         new_msg_ids.append(m.message_id)
             except Exception as e:
                 logging.error(f"Failed to resend design {code} to reviewer {reviewer_id}: {e}")
-
-        # Resend print files
-        unique_prints = list(dict.fromkeys(design.print_file_ids))
-        for i, fid in enumerate(unique_prints):
-            try:
-                await bot.send_document(
-                    reviewer_id,
-                    document=fid,
-                    caption=f"🖨 فایل چاپی {i+1}/{len(unique_prints)} — {code}"
-                )
-                await asyncio.sleep(TELEGRAM_SEND_DELAY)
-            except Exception as e:
-                logging.error(f"Failed to resend print {i+1} to reviewer {reviewer_id}: {e}")
 
         # Save new message IDs
         if new_msg_ids:

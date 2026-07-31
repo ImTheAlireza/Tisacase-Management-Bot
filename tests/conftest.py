@@ -191,11 +191,15 @@ def test_db():
 
 
 @pytest.fixture(autouse=True)
-def clean_tables(test_db):
+def clean_tables(request):
     """
     Truncates all data before each test.
-    Runs automatically for every test.
+    Runs automatically for every integration test.
     """
+    if "integration" not in request.node.nodeid:
+        yield
+        return
+    request.getfixturevalue("test_db")
     conn = get_test_connection()
     cursor = conn.cursor()
     try:
