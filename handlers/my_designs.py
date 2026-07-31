@@ -224,7 +224,10 @@ async def _show_design_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.callback_query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
+    # ✅ product line may be missing/deactivated — never dereference blindly,
+    # otherwise the whole detail panel raises and the buttons look broken.
     product_line = ProductLine.get_by_id(design.product_line_id)
+    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
 
     status_map = {
         DesignStatus.PENDING: '⏳ در انتظار بررسی',
@@ -238,7 +241,7 @@ async def _show_design_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = f"🔍 جزئیات طرح\n━━━━━━━━━━━━━━━━━━\n\n"
     text += f"🔖 کد: {display_code}\n"
-    text += f"📦 خط تولید: {product_line.icon} {product_line.name_fa}\n"
+    text += f"📦 خط تولید: {pl_name}\n"
     text += f"📊 وضعیت: {status_map.get(design.status, design.status)}\n\n"
     text += f"🕐 ثبت: {format_datetime_persian(design.created_at)}\n"
 
@@ -315,14 +318,17 @@ async def _confirm_delete_design(update: Update, context: ContextTypes.DEFAULT_T
         await update.callback_query.answer("⚠️ فقط طرح‌های در انتظار قابل حذف هستند", show_alert=True)
         return
 
+    # ✅ A missing product line must not block deletion — otherwise a design
+    # whose product line was removed could never be deleted.
     product_line = ProductLine.get_by_id(design.product_line_id)
+    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
     display_code = code
 
     text = (
         f"⚠️ تایید حذف طرح\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🔖 کد: {display_code}\n"
-        f"📦 خط تولید: {product_line.icon} {product_line.name_fa}\n\n"
+        f"📦 خط تولید: {pl_name}\n\n"
         f"🚨 آیا مطمئن هستید؟\n"
         f"کد آزاد شده و قابل استفاده مجدد خواهد بود."
     )
