@@ -127,3 +127,39 @@ class TestClearEditorState:
         assert 'code' not in user_data
         assert user_data.get('db_user') == 'keep_me'
 
+
+class TestCancelEditing:
+
+    def test_keyboards_use_cancel_editing_when_is_edit_true(self):
+        from ui.keyboards import Keyboards
+        _, markup_new = Keyboards.get_mockup_stage("TS001", "قاب موبایل", 1, is_edit=False)
+        _, markup_edit = Keyboards.get_mockup_stage("TS001", "قاب موبایل", 1, is_edit=True)
+
+        assert markup_new.inline_keyboard[-1][0].callback_data == "cancel_submission"
+        assert markup_new.inline_keyboard[-1][0].text == "❌ لغو طرح"
+
+        assert markup_edit.inline_keyboard[-1][0].callback_data == "cancel_editing"
+        assert markup_edit.inline_keyboard[-1][0].text == "❌ لغو ویرایش"
+
+    @pytest.mark.asyncio
+    @patch('handlers.my_designs._show_design_detail')
+    async def test_handle_cancel_editing_does_not_delete_design(self, mock_show_detail):
+        from handlers.editor import _handle_cancel_editing
+        update = MagicMock()
+        query = MagicMock()
+        context = MagicMock()
+        context.user_data = {'code': 'TS001', 'editing_existing': True}
+
+        with patch('models.design.Design.get_by_code') as mock_get_code:
+            mock_design = MagicMock()
+            mock_get_code.return_value = mock_design
+
+            await _handle_cancel_editing(update, query, context)
+
+            # Design.delete MUST NOT be called!
+            mock_design.delete.assert_not_called()
+            # Must call _show_design_detail to get back to design info
+            mock_show_detail.assert_called_once_with(update, context, 'TS001')
+            # Editor state should be cleared
+            assert 'editing_existing' not in context.user_data
+

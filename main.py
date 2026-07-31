@@ -475,7 +475,7 @@ if __name__ == "__main__":
     # Editor stage flow
     application.add_handler(CallbackQueryHandler(
         editor_callbacks,
-        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission|manage_mockups|manage_prints|manage_clear_mockup|manage_clear_print|manage_back|remove_mockup_\d+|remove_print_\d+)$"
+        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission|cancel_editing|manage_mockups|manage_prints|manage_clear_mockup|manage_clear_print|manage_back|remove_mockup_\d+|remove_print_\d+)$"
     ))
 
     # Reviewer

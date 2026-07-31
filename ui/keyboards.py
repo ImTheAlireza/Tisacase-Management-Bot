@@ -81,7 +81,8 @@ class Keyboards:
     def get_mockup_stage(
         code: str,
         product_name: str,
-        mockup_count: int
+        mockup_count: int,
+        is_edit: bool = False
     ) -> tuple[str, InlineKeyboardMarkup]:
         """Stage 1: Mockup upload screen"""
 
@@ -110,8 +111,8 @@ class Keyboards:
                 callback_data="stage_mockup_clear"
             )],
             [InlineKeyboardButton(
-                "❌ لغو طرح",
-                callback_data="cancel_submission"
+                "❌ لغو ویرایش" if is_edit else "❌ لغو طرح",
+                callback_data="cancel_editing" if is_edit else "cancel_submission"
             )],
         ]
 
@@ -123,7 +124,8 @@ class Keyboards:
         code: str,
         product_name: str,
         mockup_count: int,
-        print_count: int
+        print_count: int,
+        is_edit: bool = False
     ) -> tuple[str, InlineKeyboardMarkup]:
         """Stage 2: Print file upload screen"""
 
@@ -153,8 +155,8 @@ class Keyboards:
                 callback_data="stage_print_clear"
             )],
             [InlineKeyboardButton(
-                "❌ لغو طرح",
-                callback_data="cancel_submission"
+                "❌ لغو ویرایش" if is_edit else "❌ لغو طرح",
+                callback_data="cancel_editing" if is_edit else "cancel_submission"
             )],
         ]
 
@@ -166,7 +168,8 @@ class Keyboards:
         code: str,
         product_name: str,
         mockup_count: int,
-        print_count: int
+        print_count: int,
+        is_edit: bool = False
     ) -> tuple[str, InlineKeyboardMarkup]:
         """Workspace: editing hub between stages"""
 
@@ -225,8 +228,8 @@ class Keyboards:
         ])
         buttons.append([
             InlineKeyboardButton(
-                "❌ لغو طرح",
-                callback_data="cancel_submission"
+                "❌ لغو ویرایش" if is_edit else "❌ لغو طرح",
+                callback_data="cancel_editing" if is_edit else "cancel_submission"
             ),
         ])
 
@@ -238,7 +241,8 @@ class Keyboards:
         code: str,
         product_name: str,
         mockup_count: int,
-        print_count: int
+        print_count: int,
+        is_edit: bool = False
     ) -> tuple[str, InlineKeyboardMarkup]:
         """Stage 3: Final confirmation before sending to reviewer"""
 
@@ -267,8 +271,8 @@ class Keyboards:
                 callback_data="back_to_workspace"
             )],
             [InlineKeyboardButton(
-                "❌ لغو کامل",
-                callback_data="cancel_submission"
+                "❌ لغو ویرایش" if is_edit else "❌ لغو کامل",
+                callback_data="cancel_editing" if is_edit else "cancel_submission"
             )],
         ]
 
