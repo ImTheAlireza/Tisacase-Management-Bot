@@ -8,6 +8,7 @@ import traceback
 
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     CallbackQueryHandler, ContextTypes
@@ -353,56 +354,81 @@ async def send_startup_notification(context: ContextTypes.DEFAULT_TYPE):
 
 
 class TelegramLogHandler(logging.Handler):
-    """Async Queue handler for Telegram to prevent rate limits"""
+    """
+    Async Queue handler for Telegram to prevent rate limits.
+
+    Every record at INFO level or above is queued and forwarded to
+    LOG_GROUP_ID. A single background task drains the queue, so a burst of
+    log records (e.g. all the per-file logs produced while approving a design)
+    is never silently dropped while a previous log message is still being
+    sent — every record, including the "Mockup N FAILED" exceptions, reaches
+    the log group.
+    """
+    MAX_QUEUE_SIZE = 200
+
     def __init__(self, bot, chat_id):
         super().__init__()
         self.bot = bot
         self.chat_id = chat_id
         self.message_queue = []
-        self.is_sending = False
-        self._recursion_guard = False
+        self._task = None
 
     def emit(self, record):
-        if self._recursion_guard:
+        if record.levelno < logging.INFO:
             return
-
-        if record.levelno >= logging.INFO:
-            try:
-                self._recursion_guard = True
-                log_entry = self.format(record)
-                self.message_queue.append(log_entry)
-                if not self.is_sending:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self._process_queue())
-            except RuntimeError:
-                pass
-            except Exception:
-                pass
-            finally:
-                self._recursion_guard = False
-
-    async def _process_queue(self):
-        if self.is_sending:
-            return
-        self.is_sending = True
-        self._recursion_guard = True
 
         try:
-            while self.message_queue:
-                msg = self.message_queue.pop(0)
-                safe_msg = html.escape(msg[:3000])
-                try:
-                    await self.bot.send_message(
-                        self.chat_id,
-                        f"ℹ️ Bot Log\n<pre>{safe_msg}</pre>",
-                        parse_mode="HTML"
-                    )
-                    await asyncio.sleep(0.3)
-                except Exception:
-                    pass
-        finally:
-            self.is_sending = False
-            self._recursion_guard = False
+            log_entry = self.format(record)
+        except Exception:
+            return
+
+        # Bound memory: if a burst outpaces the log sender, keep the newest
+        # records (which usually describe the failure being diagnosed) and
+        # drop the oldest instead of dropping the latest log lines.
+        if len(self.message_queue) >= self.MAX_QUEUE_SIZE:
+            self.message_queue.pop(0)
+
+        self.message_queue.append(log_entry)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (e.g. emitted from a non-async thread); the
+            # message stays queued and will be sent once a loop exists.
+            return
+
+        if self._task is None or self._task.done():
+            self._task = loop.create_task(self._process_queue())
+
+    async def _process_queue(self):
+        while self.message_queue:
+            msg = self.message_queue.pop(0)
+            safe_msg = html.escape(msg[:3000])
+            try:
+                await self.bot.send_message(
+                    self.chat_id,
+                    f"ℹ️ Bot Log\n<pre>{safe_msg}</pre>",
+                    parse_mode="HTML"
+                )
+                await asyncio.sleep(0.3)
+            except RetryAfter as e:
+                # Respect Telegram flood control on the log chat itself.
+                raw = getattr(e, 'retry_after', 1)
+                if hasattr(raw, 'total_seconds'):  # datetime.timedelta (PTB >= 22)
+                    try:
+                        wait = max(int(raw.total_seconds()), 1)
+                    except (TypeError, ValueError):
+                        wait = 1
+                else:
+                    try:
+                        wait = max(int(raw or 1), 1)
+                    except (TypeError, ValueError):
+                        wait = 1
+                await asyncio.sleep(wait)
+            except Exception:
+                # Never let log delivery crash the bot; drop this single
+                # message and keep draining the rest of the queue.
+                pass
 
 
 if __name__ == "__main__":
