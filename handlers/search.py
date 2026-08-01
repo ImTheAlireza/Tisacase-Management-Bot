@@ -83,7 +83,7 @@ async def _show_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if filters.get('product_line_id'):
         pl = ProductLine.get_by_id(filters['product_line_id'])
-        filter_text += f"📦 خط تولید: {pl.icon} {pl.name_fa}\n"
+        filter_text += f"📦 خط تولید: {pl.icon} {pl.name_fa}\n" if pl else "📦 خط تولید: نامشخص\n"
     else:
         filter_text += f"📦 خط تولید: همه\n"
 
@@ -430,7 +430,9 @@ async def _show_design_details(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     from models.product_line import ProductLine
+    # ✅ product line may be missing/deactivated — guard before dereferencing
     product_line = ProductLine.get_by_id(design.product_line_id)
+    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
 
     status_map = {
         DesignStatus.PENDING: '⏳ در انتظار',
@@ -443,7 +445,7 @@ async def _show_design_details(update: Update, context: ContextTypes.DEFAULT_TYP
     # Clean rejected code for display
     display_code = code.split('_REJ_')[0] if design.status == DesignStatus.REJECTED else code
     text += f"🔖 کد: {display_code}\n"
-    text += f"📦 خط تولید: {product_line.icon} {product_line.name_fa}\n"
+    text += f"📦 خط تولید: {pl_name}\n"
     text += f"📊 وضعیت: {status_map.get(design.status, design.status)}\n\n"
     text += f"👤 طراح: {design.editor_name}\n"
     text += f"🕐 ثبت: {format_datetime_persian(design.created_at)}\n"

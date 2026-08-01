@@ -181,27 +181,30 @@ async def my_designs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _show_my_designs(update, context, query.from_user.id)
 
     elif data.startswith("mydesigns_view_"):
-        code = data.replace("mydesigns_view_", "")
+        code = data[len("mydesigns_view_"):]
         await _show_design_detail(update, context, code)
 
     elif data.startswith("mydesigns_edit_"):
-        code = data.replace("mydesigns_edit_", "")
+        code = data[len("mydesigns_edit_"):]
         await _start_edit_design(update, context, code)
 
-    elif data.startswith("mydesigns_delete_"):
-        code = data.replace("mydesigns_delete_", "")
-        await _confirm_delete_design(update, context, code)
-
+    # ⚠️ ORDER MATTERS: "mydesigns_delete_confirm_" must be checked BEFORE
+    # "mydesigns_delete_", otherwise the shorter prefix swallows the confirm
+    # callback and the delete button silently does nothing.
     elif data.startswith("mydesigns_delete_confirm_"):
-        code = data.replace("mydesigns_delete_confirm_", "")
+        code = data[len("mydesigns_delete_confirm_"):]
         await _execute_delete_design(update, context, code)
 
+    elif data.startswith("mydesigns_delete_"):
+        code = data[len("mydesigns_delete_"):]
+        await _confirm_delete_design(update, context, code)
+
     elif data.startswith("mydesigns_files_"):
-        code = data.replace("mydesigns_files_", "")
+        code = data[len("mydesigns_files_"):]
         await _send_design_files(update, context, code)
 
     elif data.startswith("mydesigns_resubmit_"):
-        code = data.replace("mydesigns_resubmit_", "")
+        code = data[len("mydesigns_resubmit_"):]
         await _handle_resubmit(update, context, code)
 
     elif data == "mydesigns_back":
@@ -221,7 +224,10 @@ async def _show_design_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.callback_query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
+    # ✅ product line may be missing/deactivated — never dereference blindly,
+    # otherwise the whole detail panel raises and the buttons look broken.
     product_line = ProductLine.get_by_id(design.product_line_id)
+    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
 
     status_map = {
         DesignStatus.PENDING: '⏳ در انتظار بررسی',
@@ -235,7 +241,7 @@ async def _show_design_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = f"🔍 جزئیات طرح\n━━━━━━━━━━━━━━━━━━\n\n"
     text += f"🔖 کد: {display_code}\n"
-    text += f"📦 خط تولید: {product_line.icon} {product_line.name_fa}\n"
+    text += f"📦 خط تولید: {pl_name}\n"
     text += f"📊 وضعیت: {status_map.get(design.status, design.status)}\n\n"
     text += f"🕐 ثبت: {format_datetime_persian(design.created_at)}\n"
 
@@ -312,14 +318,17 @@ async def _confirm_delete_design(update: Update, context: ContextTypes.DEFAULT_T
         await update.callback_query.answer("⚠️ فقط طرح‌های در انتظار قابل حذف هستند", show_alert=True)
         return
 
+    # ✅ A missing product line must not block deletion — otherwise a design
+    # whose product line was removed could never be deleted.
     product_line = ProductLine.get_by_id(design.product_line_id)
+    pl_name = f"{product_line.icon} {product_line.name_fa}" if product_line else "نامشخص"
     display_code = code
 
     text = (
         f"⚠️ تایید حذف طرح\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🔖 کد: {display_code}\n"
-        f"📦 خط تولید: {product_line.icon} {product_line.name_fa}\n\n"
+        f"📦 خط تولید: {pl_name}\n\n"
         f"🚨 آیا مطمئن هستید؟\n"
         f"کد آزاد شده و قابل استفاده مجدد خواهد بود."
     )
