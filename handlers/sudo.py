@@ -9,7 +9,7 @@ from utils.decorators import require_sudo
 from models.user import User
 from models.product_line import ProductLine
 from services.backup_service import BackupService
-from utils.helpers import get_tehran_time
+from utils.helpers import get_tehran_time, send_with_retry
 from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS
 from utils.enums import DesignStatus
 from utils.callback_lock import deduplicate_callback
@@ -19,10 +19,10 @@ def _verify_sudo_for_group_input(user_id):
     """Helper to verify sudo access for group input flow"""
     from config.settings import SUDO_USER_ID
     from models.user import User
-    
+
     if user_id != SUDO_USER_ID:
         return False
-    
+
     user = User.get_by_id(user_id)
     return user and user.is_sudo
 
@@ -60,13 +60,13 @@ async def handle_role_switch(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user.update_active_role(new_role)
 
     from ui.keyboards import Keyboards
-    
+
     # FIX: Try to delete message, but don't fail if it's already gone
     try:
         await query.message.delete()
     except Exception as e:
         logging.warning(f"Could not delete role switch message: {e}")
-    
+
     # Send new message with updated keyboard
     try:
         await context.bot.send_message(
@@ -368,21 +368,29 @@ async def broadcast_update_callback(update: Update, context: ContextTypes.DEFAUL
 
     users = User.get_all_active()
     sent_count = 0
-    
+    failure_count = 0
+
     for u in users:
         if u.user_id == SUDO_USER_ID:
             continue
         try:
-            await context.bot.send_message(
-                chat_id=u.user_id,
-                text="⏏️ ربات آپدیت شد!\n\n"
-                     "💢 برای دریافت تغییرات جدید منوی اصلی را چک کنید یا دستور /start بزنید."
+            await send_with_retry(
+                lambda user_id=u.user_id: context.bot.send_message(
+                    chat_id=user_id,
+                    text="⏏️ ربات آپدیت شد!\n\n"
+                         "💢 برای دریافت تغییرات جدید منوی اصلی را چک کنید یا دستور /start بزنید."
+                ),
+                f"Broadcast update to user {u.user_id}"
             )
             sent_count += 1
-        except Exception:
-            pass
-            
-    await query.edit_message_text(f"✅ پیام آپدیت با موفقیت به {sent_count} کاربر فعال ارسال شد!")
+        except Exception as e:
+            failure_count += 1
+            logging.error(f"Broadcast update failed for user {u.user_id}: {e}")
+
+    await query.edit_message_text(
+        f"✅ پیام آپدیت به {sent_count} کاربر فعال ارسال شد.\n"
+        f"❌ ارسال به {failure_count} کاربر ناموفق بود."
+    )
 
 
 @require_sudo
@@ -539,8 +547,8 @@ async def handle_group_id_input(update: Update, context: ContextTypes.DEFAULT_TY
         f"Chat ID: {chat_id}"
     )
     return True
-    
-    
+
+
 @require_sudo
 async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -556,9 +564,9 @@ async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TY
             "⚠️ این عملیات غیرقابل بازگشت است!"
         )
         return
-    
+
     code = args[0].strip().upper()
-    
+
     # Confirm
     keyboard = [
         [
@@ -566,21 +574,21 @@ async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("❌ انصراف", callback_data="cancel_kill")
         ]
     ]
-    
+
     from models.design import Design
     design = Design.get_by_code(code)
-    
+
     if not design:
         await update.message.reply_text(f"❌ طرح {code} یافت نشد.")
         return
-    
+
     status_fa = {
         DesignStatus.PENDING: "در انتظار",
         DesignStatus.APPROVED: "تایید شده",
         DesignStatus.REJECTED: "رد شده",
         DesignStatus.DELETED: "حذف شده"
     }.get(design.status, str(design.status))
-    
+
     await update.message.reply_text(
         f"⚠️ حذف کامل طرح\n\n"
         f"کد: {code}\n"
@@ -609,21 +617,21 @@ async def confirm_delete_design_callback(update: Update, context: ContextTypes.D
     """Handle design deletion confirmation"""
     query = update.callback_query
     await query.answer()
-    
+
     data = query.data
-    
+
     if data == "cancel_kill":
         await query.edit_message_text("❌ عملیات لغو شد.")
         return
-    
+
     if data.startswith("confirm_kill_"):
         code = data.replace("confirm_kill_", "")
-        
+
         await query.edit_message_text(f"🔄 در حال حذف {code}...")
-        
+
         from models.design import Design
         result = await Design.delete_completely(code, context.bot)
-        
+
         if result['database_deleted']:
             msg = (
                 f"✅ طرح {code} به طور کامل حذف شد\n\n"
@@ -639,7 +647,7 @@ async def confirm_delete_design_callback(update: Update, context: ContextTypes.D
                 f"❌ خطا در حذف {code}\n\n"
                 f"خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
             )
-        
+
         await query.edit_message_text(msg)
 
 @require_sudo
@@ -649,27 +657,27 @@ async def cleanup_orphans_command(update: Update, context: ContextTypes.DEFAULT_
     Delete old pending designs with no files (orphaned codes)
     """
     await update.message.reply_text("🔄 در حال اسکن طرح‌های ناقص...")
-    
+
     from services.cleanup_service import CleanupService
     result = await CleanupService.cleanup_orphaned_pending_designs(
         context.bot,
         max_age_hours=24
     )
-    
+
     msg = (
         f"✅ پاکسازی کامل شد\n\n"
         f"📊 گزارش:\n"
         f"• اسکن شده: {result['scanned']}\n"
         f"• حذف شده: {result['deleted']}\n"
     )
-    
+
     if result['codes']:
         msg += f"\n🗑 کدهای حذف شده:\n"
         msg += ", ".join(result['codes'][:20])
         if len(result['codes']) > 20:
             msg += f"\n... و {len(result['codes']) - 20} مورد دیگر"
-    
+
     if result['errors']:
         msg += f"\n\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
-    
+
     await update.message.reply_text(msg)

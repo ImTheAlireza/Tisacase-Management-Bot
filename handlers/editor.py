@@ -1,5 +1,4 @@
 import logging
-import asyncio
 import os
 import shutil
 import tempfile
@@ -14,13 +13,10 @@ from telegram import (
 )
 from telegram.ext import ContextTypes
 
-from config.settings import TELEGRAM_SEND_DELAY
-
-
 from utils.decorators import require_role
 from utils.state_manager import StateManager
 from utils.enums import DesignStatus, EditorStage
-from utils.helpers import safe_edit_message, delete_messages
+from utils.helpers import safe_edit_message, delete_messages, send_with_retry
 from utils.callback_lock import deduplicate_callback
 from services.code_service import CodeService
 from models.product_line import ProductLine
@@ -90,13 +86,9 @@ async def _handle_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ✅ 2. Delete workspace message
     if workspace_msg_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=chat_id,
-                message_id=workspace_msg_id
-            )
-        except Exception as e:
-            logging.warning(f"Could not delete workspace message on timeout: {e}")
+        deleted = await delete_messages(context.bot, chat_id, [workspace_msg_id])
+        if not deleted:
+            logging.warning(f"Could not delete workspace message {workspace_msg_id} on timeout")
 
     # ✅ 3. Notify user
     try:
@@ -309,19 +301,16 @@ async def start_new_design(
                     logging.info(f"Deleted abandoned design {old_code} for user {user_id}")
                 except Exception as e:
                     logging.error(f"Failed to delete abandoned design {old_code}: {e}")
-        
+
         # Delete workspace message
         old_workspace_msg_id = context.user_data.get('workspace_message_id')
         if old_workspace_msg_id:
-            try:
-                await context.bot.delete_message(
-                    chat_id=user_id,
-                    message_id=old_workspace_msg_id
-                )
+            deleted = await delete_messages(context.bot, user_id, [old_workspace_msg_id])
+            if deleted:
                 logging.info(f"Deleted old workspace message {old_workspace_msg_id} for user {user_id}")
-            except Exception as e:
-                logging.warning(f"Could not delete old workspace message: {e}")
-        
+            else:
+                logging.warning(f"Could not delete old workspace message {old_workspace_msg_id} for user {user_id}")
+
         # Clear the old session completely
         _clear_editor_state(context)
     # =============================================
@@ -728,58 +717,76 @@ async def _notify_reviewers_of_edit(bot, design: Design) -> None:
     ])
 
     for reviewer_id, old_msg_ids in design.all_reviewer_message_pairs():
-        # Delete old messages
-        for msg_id in old_msg_ids:
-            try:
-                await bot.delete_message(chat_id=reviewer_id, message_id=msg_id)
-            except Exception as e:
-                logging.warning(f"Could not delete old msg {msg_id} from reviewer {reviewer_id}: {e}")
+        # Delete old messages with the shared safe/paced delete helper.
+        await delete_messages(bot, reviewer_id, old_msg_ids)
 
-        # Resend updated mockups
+        # Resend updated mockups. Each chunk is retried independently so a 429
+        # or a bad media item in one chunk does not abort the whole resend.
         new_msg_ids = []
         mockups = design.mockup_file_ids
         file_types = design.file_types
 
         if mockups:
-            try:
-                if len(mockups) == 1:
-                    fid = mockups[0]
-                    caption = f"📦 {pl_name} | کد: {code}\n👤 طراح: {design.editor_name}\n\n🔄 بروزرسانی شده"
-                    is_photo = file_types.get(fid) == 'photo'
+            if len(mockups) == 1:
+                fid = mockups[0]
+                caption = f"📦 {pl_name} | کد: {code}\n👤 طراح: {design.editor_name}\n\n🔄 بروزرسانی شده"
+                is_photo = file_types.get(fid) == 'photo'
+                try:
                     if is_photo:
-                        m = await bot.send_photo(reviewer_id, photo=fid, caption=caption, reply_markup=markup)
+                        m = await send_with_retry(
+                            lambda: bot.send_photo(reviewer_id, photo=fid, caption=caption, reply_markup=markup),
+                            f"Resend updated design {code} photo to reviewer {reviewer_id}"
+                        )
                     else:
-                        m = await bot.send_document(reviewer_id, document=fid, caption=caption, reply_markup=markup)
+                        m = await send_with_retry(
+                            lambda: bot.send_document(reviewer_id, document=fid, caption=caption, reply_markup=markup),
+                            f"Resend updated design {code} document to reviewer {reviewer_id}"
+                        )
                     new_msg_ids.append(m.message_id)
-                else:
-                    for chunk_start in range(0, len(mockups), 10):
-                        chunk = mockups[chunk_start:chunk_start + 10]
-                        media_group = []
-                        for i, fid in enumerate(chunk):
-                            idx = chunk_start + i
-                            cap = (
-                                f"📦 {pl_name} | کد: {code} ({idx+1}/{len(mockups)})\n"
-                                f"👤 طراح: {design.editor_name}\n🔄 بروزرسانی شده"
-                            ) if idx == 0 else ""
-                            is_photo = file_types.get(fid) == 'photo'
-                            if is_photo:
-                                media_group.append(InputMediaPhoto(media=fid, caption=cap))
-                            else:
-                                media_group.append(InputMediaDocument(media=fid, caption=cap))
-                        msgs = await bot.send_media_group(reviewer_id, media=media_group)
+                except Exception as e:
+                    logging.error(f"Failed to resend design {code} to reviewer {reviewer_id}: {e}")
+            else:
+                for chunk_start in range(0, len(mockups), 10):
+                    chunk = mockups[chunk_start:chunk_start + 10]
+                    media_group = []
+                    for i, fid in enumerate(chunk):
+                        idx = chunk_start + i
+                        cap = (
+                            f"📦 {pl_name} | کد: {code} ({idx+1}/{len(mockups)})\n"
+                            f"👤 طراح: {design.editor_name}\n🔄 بروزرسانی شده"
+                        ) if idx == 0 else ""
+                        is_photo = file_types.get(fid) == 'photo'
+                        if is_photo:
+                            media_group.append(InputMediaPhoto(media=fid, caption=cap))
+                        else:
+                            media_group.append(InputMediaDocument(media=fid, caption=cap))
+                    try:
+                        msgs = await send_with_retry(
+                            lambda media_group=media_group: bot.send_media_group(reviewer_id, media=media_group),
+                            f"Resend updated design {code} media chunk {chunk_start // 10 + 1} to reviewer {reviewer_id}"
+                        )
                         new_msg_ids.extend([m.message_id for m in msgs])
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to resend design {code} chunk {chunk_start // 10 + 1} "
+                            f"to reviewer {reviewer_id}: {e}"
+                        )
 
-                    # Action buttons as separate message
-                    if new_msg_ids:
-                        m = await bot.send_message(
-                            reviewer_id,
-                            f"📋 بررسی {pl_name} — {code}\n🔄 بروزرسانی شده",
-                            reply_markup=markup,
-                            reply_to_message_id=new_msg_ids[-1]
+                # Action buttons as separate message
+                if new_msg_ids:
+                    try:
+                        m = await send_with_retry(
+                            lambda: bot.send_message(
+                                reviewer_id,
+                                f"📋 بررسی {pl_name} — {code}\n🔄 بروزرسانی شده",
+                                reply_markup=markup,
+                                reply_to_message_id=new_msg_ids[-1]
+                            ),
+                            f"Resend updated design {code} action buttons to reviewer {reviewer_id}"
                         )
                         new_msg_ids.append(m.message_id)
-            except Exception as e:
-                logging.error(f"Failed to resend design {code} to reviewer {reviewer_id}: {e}")
+                    except Exception as e:
+                        logging.error(f"Failed to resend action buttons for {code} to reviewer {reviewer_id}: {e}")
 
         # Save new message IDs
         if new_msg_ids:
@@ -805,40 +812,56 @@ async def _handle_preview_files(query, context, chat_id: int) -> None:
 
     # Send mockups as media group (chunked to Telegram's 10-item limit)
     if mockups:
-        try:
-            if len(mockups) == 1:
-                await query.message.chat.send_photo(
-                    photo=mockups[0],
-                    caption=f"🎨 موکاپ 1/1 — {code}"
+        if len(mockups) == 1:
+            try:
+                await send_with_retry(
+                    lambda: query.message.chat.send_photo(
+                        photo=mockups[0],
+                        caption=f"🎨 موکاپ 1/1 — {code}"
+                    ),
+                    f"Preview mockup 1/1 for {code}"
                 )
-            else:
-                for chunk_start in range(0, len(mockups), 10):
-                    chunk = mockups[chunk_start:chunk_start + 10]
-                    chunk_num = chunk_start // 10 + 1
-                    total_chunks = (len(mockups) + 9) // 10
-                    media_group = [
-                        InputMediaPhoto(
-                            media=fid,
-                            caption=f"🎨 موکاپ {chunk_start+i+1}/{len(mockups)} — {code}"
-                            if i == 0 and chunk_num == 1 else ""
-                        )
-                        for i, fid in enumerate(chunk)
-                    ]
-                    await query.message.chat.send_media_group(media=media_group)
-        except Exception as e:
-            logging.error(f"Failed to send mockup preview: {e}")
-            await query.message.chat.send_message("❌ خطا در ارسال موکاپ‌ها.")
+            except Exception as e:
+                logging.error(f"Failed to send mockup preview: {e}")
+                await query.message.chat.send_message("❌ خطا در ارسال موکاپ‌ها.")
+        else:
+            failed_chunks = 0
+            for chunk_start in range(0, len(mockups), 10):
+                chunk = mockups[chunk_start:chunk_start + 10]
+                chunk_num = chunk_start // 10 + 1
+                media_group = [
+                    InputMediaPhoto(
+                        media=fid,
+                        caption=f"🎨 موکاپ {chunk_start+i+1}/{len(mockups)} — {code}"
+                        if i == 0 and chunk_num == 1 else ""
+                    )
+                    for i, fid in enumerate(chunk)
+                ]
+                try:
+                    await send_with_retry(
+                        lambda media_group=media_group: query.message.chat.send_media_group(media=media_group),
+                        f"Preview mockup chunk {chunk_num} for {code}"
+                    )
+                except Exception as e:
+                    failed_chunks += 1
+                    logging.error(f"Failed to send mockup preview chunk {chunk_num}: {e}")
+            if failed_chunks:
+                await query.message.chat.send_message(
+                    f"❌ خطا در ارسال {failed_chunks} بخش از موکاپ‌ها."
+                )
 
     # Send prints individually as documents
     if prints:
         unique_prints = list(dict.fromkeys(prints))
         for i, fid in enumerate(unique_prints):
             try:
-                await query.message.chat.send_document(
-                    document=fid,
-                    caption=f"🖨 فایل چاپی {i+1}/{len(unique_prints)} — {code}"
+                await send_with_retry(
+                    lambda fid=fid, i=i: query.message.chat.send_document(
+                        document=fid,
+                        caption=f"🖨 فایل چاپی {i+1}/{len(unique_prints)} — {code}"
+                    ),
+                    f"Preview print {i+1}/{len(unique_prints)} for {code}"
                 )
-                await asyncio.sleep(TELEGRAM_SEND_DELAY)
             except Exception as e:
                 logging.error(f"Failed to send print preview {i}: {e}")
 
@@ -977,7 +1000,7 @@ async def _handle_submit_to_reviewer(
         ]
     ])
 
-    # Send to all reviewers in parallel
+    # Send to all reviewers sequentially (paced/retried per Telegram request).
     async def send_to_reviewer(reviewer: User) -> Tuple[User, bool, list[int]]:
         """Send design to a single reviewer. Returns (reviewer, success, msg_ids)"""
         msg_ids: list[int] = []
@@ -988,14 +1011,20 @@ async def _handle_submit_to_reviewer(
                 # Use stored file type instead of file_id prefix
                 is_photo = file_types.get(fid) == 'photo'
                 if is_photo:
-                    m = await context.bot.send_photo(
-                        reviewer.user_id, photo=fid,
-                        caption=caption, reply_markup=markup
+                    m = await send_with_retry(
+                        lambda: context.bot.send_photo(
+                            reviewer.user_id, photo=fid,
+                            caption=caption, reply_markup=markup
+                        ),
+                        f"Send design {code} photo to reviewer {reviewer.user_id}"
                     )
                 else:
-                    m = await context.bot.send_document(
-                        reviewer.user_id, document=fid,
-                        caption=caption, reply_markup=markup
+                    m = await send_with_retry(
+                        lambda: context.bot.send_document(
+                            reviewer.user_id, document=fid,
+                            caption=caption, reply_markup=markup
+                        ),
+                        f"Send design {code} document to reviewer {reviewer.user_id}"
                     )
                 msg_ids.append(m.message_id)
 
@@ -1017,31 +1046,47 @@ async def _handle_submit_to_reviewer(
                         else:
                             media_group.append(InputMediaDocument(media=fid, caption=cap))
 
-                    msgs = await context.bot.send_media_group(
-                        reviewer.user_id, media=media_group
-                    )
-                    msg_ids.extend([m.message_id for m in msgs])
+                    try:
+                        msgs = await send_with_retry(
+                            lambda media_group=media_group: context.bot.send_media_group(
+                                reviewer.user_id, media=media_group
+                            ),
+                            f"Send design {code} chunk {chunk_start // 10 + 1} to reviewer {reviewer.user_id}"
+                        )
+                        msg_ids.extend([m.message_id for m in msgs])
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to send design {code} chunk {chunk_start // 10 + 1} "
+                            f"to reviewer {reviewer.user_id}: {e}"
+                        )
+                        raise
 
                 # Action buttons as separate message (reply to last mockup)
                 if msg_ids:
-                    m = await context.bot.send_message(
-                        reviewer.user_id,
-                        f"📋 بررسی {product_name} — {code}",
-                        reply_markup=markup,
-                        reply_to_message_id=msg_ids[-1]
+                    m = await send_with_retry(
+                        lambda: context.bot.send_message(
+                            reviewer.user_id,
+                            f"📋 بررسی {product_name} — {code}",
+                            reply_markup=markup,
+                            reply_to_message_id=msg_ids[-1]
+                        ),
+                        f"Send design {code} action buttons to reviewer {reviewer.user_id}"
                     )
                     msg_ids.append(m.message_id)
 
-            return reviewer, True, msg_ids
+            return reviewer, bool(msg_ids), msg_ids
 
         except Exception as e:
             logging.error(f"Failed to send design {code} to reviewer {reviewer.user_id}: {e}")
+            if msg_ids:
+                await delete_messages(context.bot, reviewer.user_id, msg_ids)
             return reviewer, False, []
 
-    # Execute all sends in parallel
+    # Execute sends sequentially to avoid burst/flood failures across reviewers.
     total_mockups: int = len(mockups)
-    send_tasks = [send_to_reviewer(r) for r in reviewers]
-    results = await asyncio.gather(*send_tasks, return_exceptions=True)
+    results = []
+    for reviewer in reviewers:
+        results.append(await send_to_reviewer(reviewer))
 
     # Process results
     successful_sends: int = 0

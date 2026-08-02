@@ -1,15 +1,13 @@
 import html
-import asyncio
 from telegram import Update, InputFile
-from telegram.error import RetryAfter
 from telegram.ext import ContextTypes
 from utils.decorators import require_role
 from models.design import Design
 from models.design_group_message import DesignGroupMessage
 from models.user import User
 from models.product_line import ProductLine
-from utils.helpers import safe_edit_message, delete_messages
-from config.settings import SUDO_USER_ID, MAX_FILE_SIZE_DOWNLOAD_MB, LOG_GROUP_ID, TELEGRAM_SEND_DELAY
+from utils.helpers import safe_edit_message, delete_messages, send_with_retry
+from config.settings import SUDO_USER_ID, MAX_FILE_SIZE_DOWNLOAD_MB, LOG_GROUP_ID
 import logging
 from io import BytesIO
 from utils.enums import DesignStatus
@@ -19,57 +17,21 @@ LOG_TAG = "[REVIEW]"
 REJECT_REASON_PROMPT = "دلیل رد این طرح رو روی همین پیام ریپلای کنید."
 REJECT_REASON_STATE_KEY = "awaiting_reject_reasons"
 MAX_REJECTION_REASON_LENGTH = 3000
-MAX_SEND_RETRIES = 3
 
 
 async def _log_to_group(context, text: str) -> None:
     """Send a log message to the LOG_GROUP_ID channel (sudo-only)."""
     try:
-        await context.bot.send_message(
-            chat_id=LOG_GROUP_ID,
-            text=text,
-            parse_mode="HTML"
+        await send_with_retry(
+            lambda: context.bot.send_message(
+                chat_id=LOG_GROUP_ID,
+                text=text,
+                parse_mode="HTML"
+            ),
+            f"{LOG_TAG} send log to LOG_GROUP_ID"
         )
     except Exception as e:
         logging.error(f"{LOG_TAG} Failed to send log to LOG_GROUP_ID: {e}")
-
-
-async def _send_media_with_retry(send, label: str, max_retries: int = MAX_SEND_RETRIES):
-    """
-    Send one media message, retrying on Telegram flood control (HTTP 429).
-
-    Sending many files back-to-back to the same group trips Telegram's
-    ~20 messages/minute limit, which is exactly why some mockups in a batch
-    silently never made it to the products group. RetryAfter lets us wait
-    the server-requested delay and resend instead of dropping the file.
-    """
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            return await send()
-        except RetryAfter as e:
-            last_error = e
-            wait = _retry_after_seconds(e)
-            logging.warning(
-                f"{LOG_TAG} {label} flood control (429), "
-                f"retrying in {wait}s (attempt {attempt}/{max_retries})"
-            )
-            await asyncio.sleep(wait)
-    raise last_error
-
-
-def _retry_after_seconds(error) -> int:
-    """Extract the retry delay from a RetryAfter error, in whole seconds."""
-    raw = getattr(error, 'retry_after', 1)
-    if hasattr(raw, 'total_seconds'):  # datetime.timedelta (PTB >= 22)
-        try:
-            return max(int(raw.total_seconds()), 1)
-        except (TypeError, ValueError):
-            return 1
-    try:
-        return max(int(raw or 1), 1)
-    except (TypeError, ValueError):
-        return 1
 
 
 def _review_key(update, context) -> str:
@@ -510,28 +472,28 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     # ── Fallback: if file_types is missing, try photo then document
                     if not has_type:
                         try:
-                            m = await _send_media_with_retry(
+                            m = await send_with_retry(
                                 lambda: context.bot.send_photo(
                                     product_line.group_products, photo=fid, caption=cap
                                 ),
                                 label
                             )
                         except Exception:
-                            m = await _send_media_with_retry(
+                            m = await send_with_retry(
                                 lambda: context.bot.send_document(
                                     product_line.group_products, document=fid, caption=cap
                                 ),
                                 f"{label} (document fallback)"
                             )
                     elif is_photo:
-                        m = await _send_media_with_retry(
+                        m = await send_with_retry(
                             lambda: context.bot.send_photo(
                                 product_line.group_products, photo=fid, caption=cap
                             ),
                             label
                         )
                     else:
-                        m = await _send_media_with_retry(
+                        m = await send_with_retry(
                             lambda: context.bot.send_document(
                                 product_line.group_products, document=fid, caption=cap
                             ),
@@ -554,11 +516,6 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 except Exception as e:
                     logging.exception(f"{LOG_TAG} {label} FAILED: {code} | fid={fid[:30]}")
                     mockup_results.append((fid, False, str(e)[:100]))
-                finally:
-                    # Pace the sends: back-to-back media to the same group trips
-                    # Telegram flood control, which is why some mockups in a batch
-                    # used to be silently missing from the products group.
-                    await asyncio.sleep(TELEGRAM_SEND_DELAY)
 
             # ── PRINT FILES → PRINT GROUP ─────────────────────
             unique_prints = list(dict.fromkeys(design.print_file_ids))
@@ -578,7 +535,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                     max_size_bytes = MAX_FILE_SIZE_DOWNLOAD_MB * 1024 * 1024
                     if file.file_size and file.file_size > max_size_bytes:
-                        m = await _send_media_with_retry(
+                        m = await send_with_retry(
                             lambda: context.bot.send_document(
                                 chat_id=product_line.group_print, document=fid,
                                 caption=f"⚠️ {new_filename} (فایل بزرگ — نام تغییر نکرد)"
@@ -587,7 +544,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         )
                     else:
                         file_bytes = await file.download_as_bytearray()
-                        m = await _send_media_with_retry(
+                        m = await send_with_retry(
                             lambda: context.bot.send_document(
                                 chat_id=product_line.group_print,
                                 document=InputFile(BytesIO(file_bytes), filename=new_filename)
@@ -610,8 +567,6 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 except Exception as e:
                     logging.exception(f"{LOG_TAG} {label} FAILED: {code} | fid={fid[:30]}")
                     print_results.append((fid, False, str(e)[:100]))
-                finally:
-                    await asyncio.sleep(TELEGRAM_SEND_DELAY)
 
         else:
             reason = "product_line is None" if not product_line else f"missing: {product_line.missing_groups()}"
