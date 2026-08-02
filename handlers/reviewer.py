@@ -18,6 +18,21 @@ REJECT_REASON_PROMPT = "دلیل رد این طرح رو روی همین پیا�
 REJECT_REASON_STATE_KEY = "awaiting_reject_reasons"
 MAX_REJECTION_REASON_LENGTH = 3000
 
+__all__ = [
+    "review_callback",
+    "handle_reject_reason_reply",
+    "_send_media_with_retry",
+]
+
+
+async def _send_media_with_retry(send, label: str, max_retries: int = 3):
+    """Backward-compatible wrapper for older imports/tests.
+
+    The shared implementation lives in utils.helpers.send_with_retry; keep this
+    symbol exported so main/tests/deployments that import it do not fail.
+    """
+    return await send_with_retry(send, label, max_retries=max_retries)
+
 
 async def _log_to_group(context, text: str) -> None:
     """Send a log message to the LOG_GROUP_ID channel (sudo-only)."""
