@@ -29,6 +29,32 @@ def _back_markup():
     ])
 
 
+def _as_int(value) -> int:
+    return int(value or 0)
+
+
+def _trend(current, previous) -> str:
+    """Format current-vs-previous-month trend with up/down emojis."""
+    current = _as_int(current)
+    previous = _as_int(previous)
+
+    if previous == 0:
+        if current == 0:
+            return "➖ 0%"
+        return "⬆️ جدید"
+
+    change = ((current - previous) / previous) * 100
+    if change > 0:
+        return f"⬆️ +{change:.1f}%"
+    if change < 0:
+        return f"⬇️ {change:.1f}%"
+    return "➖ 0%"
+
+
+def _metric(value, previous) -> str:
+    return f"{_as_int(value)} ({_trend(value, previous)})"
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not is_privileged(user_id):
@@ -93,18 +119,25 @@ def _build_lines_text() -> str:
     lines = ["📦 آمار خطوط تولید\n━━━━━━━━━━━━━━━━━━"]
     for r in rows:
         active = "✅" if r['is_active'] else "🔴"
-        
+
         pending_str = ", ".join(r['pending_codes']) if r['pending_codes'] else "هیچ"
         appr_str = ", ".join(r['recent_approved']) if r['recent_approved'] else "هیچ"
         rej_str = ", ".join(r['recent_rejected']) if r['recent_rejected'] else "هیچ"
-        
+
         lines.append(
             f"\n{active} {r['icon']} {r['name_fa']} ({r['code_prefix']})\n"
             f"  ⏳ کدهای در انتظار: {pending_str}\n"
             f"  ✅ ۱۰ تایید اخیر: {appr_str}\n"
             f"  ❌ ۱۰ رد اخیر: {rej_str}\n"
-            f"  امروز:  ثبت {r['submitted_today']} | تایید {r['approved_today']} | رد {r['rejected_today']}\n"
-            f"  هفته:   ثبت {r['submitted_week']} | تایید {r['approved_week']} | رد {r['rejected_week']}\n"
+            f"  امروز:  ثبت {_metric(r['submitted_today'], r['submitted_yesterday'])} | "
+            f"تایید {_metric(r['approved_today'], r['approved_yesterday'])} | "
+            f"رد {_metric(r['rejected_today'], r['rejected_yesterday'])}\n"
+            f"  هفته:   ثبت {_metric(r['submitted_week'], r['submitted_prev_week'])} | "
+            f"تایید {_metric(r['approved_week'], r['approved_prev_week'])} | "
+            f"رد {_metric(r['rejected_week'], r['rejected_prev_week'])}\n"
+            f"  ماه:    ثبت {_metric(r['submitted_month'], r['submitted_prev_month'])} | "
+            f"تایید {_metric(r['approved_month'], r['approved_prev_month'])} | "
+            f"رد {_metric(r['rejected_month'], r['rejected_prev_month'])}\n"
             f"  کل:     ثبت {r['total_all']} | تایید {r['approved_all']} | رد {r['rejected_all']} | انتظار {r['pending_all']}\n"
         )
     return '\n'.join(lines)
@@ -128,8 +161,15 @@ def _build_users_text() -> str:
             name = e['editor_name'] or "نامشخص"
             lines.append(
                 f"\n  👤 {name}\n"
-                f"    امروز:  ثبت {e['submitted_today']} | تایید {e['approved_today']} | رد {e['rejected_today']}\n"
-                f"    هفته:   ثبت {e['submitted_week']} | تایید {e['approved_week']} | رد {e['rejected_week']}\n"
+                f"    امروز:  ثبت {_metric(e['submitted_today'], e['submitted_yesterday'])} | "
+                f"تایید {_metric(e['approved_today'], e['approved_yesterday'])} | "
+                f"رد {_metric(e['rejected_today'], e['rejected_yesterday'])}\n"
+                f"    هفته:   ثبت {_metric(e['submitted_week'], e['submitted_prev_week'])} | "
+                f"تایید {_metric(e['approved_week'], e['approved_prev_week'])} | "
+                f"رد {_metric(e['rejected_week'], e['rejected_prev_week'])}\n"
+                f"    ماه:    ثبت {_metric(e['submitted_month'], e['submitted_prev_month'])} | "
+                f"تایید {_metric(e['approved_month'], e['approved_prev_month'])} | "
+                f"رد {_metric(e['rejected_month'], e['rejected_prev_month'])}\n"
                 f"    کل:     ثبت {e['submitted_all']} | تایید {e['approved_all']} | رد {e['rejected_all']} | انتظار {e['pending_all']}"
             )
 
@@ -141,8 +181,15 @@ def _build_users_text() -> str:
             name = r['reviewer_name'] or "نامشخص"
             lines.append(
                 f"\n  👤 {name}\n"
-                f"    امروز:  بررسی {r['reviewed_today']} | تایید {r['approved_today']} | رد {r['rejected_today']}\n"
-                f"    هفته:   بررسی {r['reviewed_week']} | تایید {r['approved_week']} | رد {r['rejected_week']}\n"
+                f"    امروز:  بررسی {_metric(r['reviewed_today'], r['reviewed_yesterday'])} | "
+                f"تایید {_metric(r['approved_today'], r['approved_yesterday'])} | "
+                f"رد {_metric(r['rejected_today'], r['rejected_yesterday'])}\n"
+                f"    هفته:   بررسی {_metric(r['reviewed_week'], r['reviewed_prev_week'])} | "
+                f"تایید {_metric(r['approved_week'], r['approved_prev_week'])} | "
+                f"رد {_metric(r['rejected_week'], r['rejected_prev_week'])}\n"
+                f"    ماه:    بررسی {_metric(r['reviewed_month'], r['reviewed_prev_month'])} | "
+                f"تایید {_metric(r['approved_month'], r['approved_prev_month'])} | "
+                f"رد {_metric(r['rejected_month'], r['rejected_prev_month'])}\n"
                 f"    کل:     بررسی {r['reviewed_all']} | تایید {r['approved_all']} | رد {r['rejected_all']}"
             )
 
@@ -202,7 +249,10 @@ def _build_system_text() -> str:
         "🤖 وضعیت سیستم\n━━━━━━━━━━━━━━━━━━",
         "",
         "📊 کل طرح‌ها:",
-        f"  امروز ثبت شده:  {t['submitted_today']}",
+        f"  امروز ثبت شده:  {_metric(t['submitted_today'], t['submitted_yesterday'])}",
+        f"  ماه جاری:       ثبت {_metric(t['submitted_month'], t['submitted_prev_month'])} | "
+        f"تایید {_metric(t['approved_month'], t['approved_prev_month'])} | "
+        f"رد {_metric(t['rejected_month'], t['rejected_prev_month'])}",
         f"  در انتظار:       {t[DesignStatus.PENDING]}",
         f"  تایید شده:       {t[DesignStatus.APPROVED]}",
         f"  رد شده:          {t[DesignStatus.REJECTED]}",
