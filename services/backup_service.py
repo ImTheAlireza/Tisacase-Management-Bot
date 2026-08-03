@@ -23,14 +23,14 @@ def _trend(current, previous) -> str:
     previous = _as_int(previous)
     if previous == 0:
         if current == 0:
-            return "➖ 0%"
-        return "⬆️ جدید"
+            return "➖"
+        return "🔼 جدید"
     change = ((current - previous) / previous) * 100
     if change > 0:
-        return f"⬆️ +{change:.1f}%"
+        return "🔼"
     if change < 0:
-        return f"⬇️ {change:.1f}%"
-    return "➖ 0%"
+        return "🔽"
+    return "➖"
 
 
 def _metric(value, previous) -> str:
