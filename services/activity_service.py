@@ -28,9 +28,22 @@ class ActivityService:
         if not silent:
             try:
                 import asyncio
+                from utils.helpers import send_with_retry
+
                 loop = asyncio.get_event_loop()
                 text = f"🔔 **گزارش فعالیت**\n━━━━━━━━━━━━━\n{details_fa}"
-                loop.create_task(bot.send_message(chat_id=SUDO_USER_ID, text=text, parse_mode="Markdown"))
+                task = loop.create_task(send_with_retry(
+                    lambda: bot.send_message(chat_id=SUDO_USER_ID, text=text, parse_mode="Markdown"),
+                    "Activity sudo notification"
+                ))
+
+                def _log_task_failure(done_task):
+                    try:
+                        done_task.result()
+                    except Exception as task_error:
+                        logging.error(f"Sudo notification failed: {task_error}")
+
+                task.add_done_callback(_log_task_failure)
             except Exception as e:
                 logging.error(f"Sudo notification failed: {e}")
 

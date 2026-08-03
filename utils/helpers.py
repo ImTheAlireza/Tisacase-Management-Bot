@@ -1,10 +1,16 @@
+import asyncio
 import pytz
 import logging
 from datetime import datetime
-from typing import Optional
-from config.settings import TIMEZONE
+from typing import Awaitable, Callable, Optional, TypeVar
+
+from telegram.error import RetryAfter
+
+from config.settings import TELEGRAM_SEND_DELAY, TIMEZONE
 
 TEHRAN_TZ = pytz.timezone(TIMEZONE)
+T = TypeVar('T')
+DEFAULT_MAX_SEND_RETRIES = 3
 
 
 def get_tehran_time(dt: Optional[datetime] = None) -> datetime:
@@ -47,15 +53,92 @@ def format_datetime_persian(dt: Optional[datetime]) -> str:
     return tehran_time.strftime('%Y/%m/%d %H:%M')
 
 
-async def delete_messages(bot, chat_id: int, message_ids: list[int]) -> None:
-    """Safely delete multiple messages."""
+def retry_after_seconds(error: RetryAfter) -> int:
+    """Extract Telegram RetryAfter delay as whole seconds.
+
+    PTB v20 exposes ``retry_after`` as an int; PTB v22 may expose it as a
+    ``datetime.timedelta``. Keep this helper centralized so all send/delete
+    paths handle both versions consistently.
+    """
+    raw = getattr(error, 'retry_after', 1)
+    if hasattr(raw, 'total_seconds'):
+        try:
+            return max(int(raw.total_seconds()), 1)
+        except (TypeError, ValueError):
+            return 1
+    try:
+        return max(int(raw or 1), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+async def send_with_retry(
+    send: Callable[[], Awaitable[T]],
+    label: str = "Telegram request",
+    *,
+    max_retries: int = DEFAULT_MAX_SEND_RETRIES,
+    pace_delay: Optional[float] = None,
+) -> T:
+    """Run one Telegram API call with flood-control retry and pacing.
+
+    Args:
+        send: zero-argument callable returning the awaitable Telegram request.
+        label: human-readable operation label for logs.
+        max_retries: total attempts for RetryAfter/429 responses.
+        pace_delay: delay after the request finishes. Defaults to
+            ``TELEGRAM_SEND_DELAY``; pass ``0`` to disable.
+
+    Raises:
+        The final Telegram exception after retries are exhausted. Non-429
+        exceptions are not swallowed so callers can log per-user/per-file errors.
+    """
+    attempts = max(max_retries, 1)
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                return await send()
+            except RetryAfter as e:
+                wait = retry_after_seconds(e)
+                if attempt >= attempts:
+                    logging.error(
+                        f"{label} flood control (429), retries exhausted "
+                        f"after {attempt}/{attempts} attempts; retry_after={wait}s"
+                    )
+                    raise
+                logging.warning(
+                    f"{label} flood control (429), retrying in {wait}s "
+                    f"(attempt {attempt}/{attempts})"
+                )
+                await asyncio.sleep(wait)
+    finally:
+        delay = TELEGRAM_SEND_DELAY if pace_delay is None else pace_delay
+        if delay and delay > 0:
+            await asyncio.sleep(delay)
+
+    # Unreachable, but keeps type checkers happy.
+    raise RuntimeError(f"{label} failed unexpectedly")
+
+
+async def delete_messages(bot, chat_id: int, message_ids: list[int]) -> int:
+    """Safely delete multiple messages with pacing and 429 retry.
+
+    Returns the number of messages successfully deleted. Individual failures are
+    logged and do not abort the rest of the deletion batch.
+    """
     if not message_ids:
-        return
+        return 0
+
+    deleted_count = 0
     for msg_id in message_ids:
         try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            await send_with_retry(
+                lambda msg_id=msg_id: bot.delete_message(chat_id=chat_id, message_id=msg_id),
+                f"Delete message {msg_id} in chat {chat_id}"
+            )
+            deleted_count += 1
         except Exception as e:
-            logging.warning(f"Failed to delete message {msg_id}: {e}")
+            logging.warning(f"Failed to delete message {msg_id} in chat {chat_id}: {e}")
+    return deleted_count
 
 
 async def safe_edit_message(

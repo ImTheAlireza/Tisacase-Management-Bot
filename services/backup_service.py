@@ -13,6 +13,29 @@ from config.database import get_db_connection
 from config.settings import DB_CONFIG
 from utils.helpers import get_tehran_time
 
+
+def _as_int(value) -> int:
+    return int(value or 0)
+
+
+def _trend(current, previous) -> str:
+    current = _as_int(current)
+    previous = _as_int(previous)
+    if previous == 0:
+        if current == 0:
+            return "➖ 0%"
+        return "⬆️ جدید"
+    change = ((current - previous) / previous) * 100
+    if change > 0:
+        return f"⬆️ +{change:.1f}%"
+    if change < 0:
+        return f"⬇️ {change:.1f}%"
+    return "➖ 0%"
+
+
+def _metric(value, previous) -> str:
+    return f"{_as_int(value)} ({_trend(value, previous)})"
+
 class BackupService:
 
     @staticmethod
@@ -24,7 +47,7 @@ class BackupService:
             # Create temporary MySQL config file
             temp_dir = tempfile.mkdtemp()
             config_file = os.path.join(temp_dir, 'my.cnf')
-            
+
             try:
                 # Write credentials to config file with secure permissions
                 with open(config_file, 'w') as f:
@@ -32,10 +55,10 @@ class BackupService:
                     f.write(f"host={DB_CONFIG['host']}\n")
                     f.write(f"user={DB_CONFIG['user']}\n")
                     f.write(f"password={DB_CONFIG['password']}\n")
-                
+
                 # Set file permissions to 600 (owner read/write only)
                 os.chmod(config_file, 0o600)
-                
+
                 # Run mysqldump using the config file
                 dump_cmd = [
                     'mysqldump',
@@ -46,14 +69,14 @@ class BackupService:
                     '--triggers',
                     '--add-drop-table'
                 ]
-                
+
                 result = subprocess.run(
                     dump_cmd, capture_output=True, text=True,
                     check=True, timeout=300
                 )
-                
+
                 return result.stdout
-                
+
             finally:
                 # Clean up temp config file
                 try:
@@ -61,7 +84,7 @@ class BackupService:
                     os.rmdir(temp_dir)
                 except Exception as e:
                     logging.warning(f"Failed to cleanup temp mysqldump config: {e}")
-                    
+
         except subprocess.TimeoutExpired:
             logging.error("Database backup timed out (>5 minutes)")
             return None
@@ -75,14 +98,14 @@ class BackupService:
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
             from datetime import datetime, date
-            
+
             # FIX: Custom JSON encoder for dates
             def json_serial(obj):
                 """JSON serializer for objects not serializable by default json code"""
                 if isinstance(obj, (datetime, date)):
                     return obj.isoformat()
                 return str(obj)
-            
+
             codes_data = {}
             cursor.execute("SELECT * FROM product_lines ORDER BY display_order")
             product_lines = cursor.fetchall()
@@ -268,20 +291,20 @@ class BackupService:
         try:
             # FIX: Run blocking operations in executor
             loop = asyncio.get_event_loop()
-            
+
             logging.info("Creating database dump...")
             sql_dump = await loop.run_in_executor(
                 None, BackupService.create_database_backup
             )
-            
+
             codes_json = await loop.run_in_executor(
                 None, BackupService.create_codes_export
             )
-            
+
             stats = await loop.run_in_executor(
                 None, BackupService.get_stats_summary
             )
-            
+
             # FIX: Wrap the entire ZIP creation in executor since it's all blocking I/O
             def create_zip_file():
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -336,7 +359,7 @@ class BackupService:
                 file_size = os.path.getsize(zip_path)
                 logging.info(f"✅ Backup ZIP created: {zip_filename} ({file_size} bytes)")
                 return zip_path
-            
+
             # Run ZIP creation in executor
             result = await loop.run_in_executor(None, create_zip_file)
             return result
@@ -364,7 +387,8 @@ async def send_daily_backup(context):
 
     # Today's activity per product line
     has_today_activity = any(
-        (r['submitted_today'] or 0) + (r['approved_today'] or 0) + (r['rejected_today'] or 0) > 0
+        (r['submitted_today'] or 0) + (r['approved_today'] or 0) + (r['rejected_today'] or 0) +
+        (r['submitted_yesterday'] or 0) + (r['approved_yesterday'] or 0) + (r['rejected_yesterday'] or 0) > 0
         for r in summary['today_lines']
     )
 
@@ -374,12 +398,15 @@ async def send_daily_backup(context):
             s = r['submitted_today'] or 0
             a = r['approved_today'] or 0
             rj = r['rejected_today'] or 0
-            if s + a + rj == 0:
+            sy = r['submitted_yesterday'] or 0
+            ay = r['approved_yesterday'] or 0
+            rjy = r['rejected_yesterday'] or 0
+            if s + a + rj + sy + ay + rjy == 0:
                 continue
             parts = []
-            if s: parts.append(f"ثبت {s}")
-            if a: parts.append(f"تایید {a}")
-            if rj: parts.append(f"رد {rj}")
+            if s or sy: parts.append(f"ثبت {_metric(s, sy)}")
+            if a or ay: parts.append(f"تایید {_metric(a, ay)}")
+            if rj or rjy: parts.append(f"رد {_metric(rj, rjy)}")
             lines.append(f"  {r['icon']} {r['name_fa']}: {' | '.join(parts)}")
     else:
         lines.append("\n📦 فعالیت امروز: —")

@@ -484,8 +484,8 @@ class Design:
         finally:
             cursor.close()
             conn.close()
-            
-          
+
+
     @staticmethod
     async def delete_completely(code: str, bot) -> dict:
         """
@@ -510,6 +510,7 @@ class Design:
             }
         """
         from models.design_group_message import DesignGroupMessage
+        from utils.helpers import delete_messages
 
         result = {
             'code': code,
@@ -536,20 +537,15 @@ class Design:
             group_msgs = DesignGroupMessage.get_by_code(code)
 
             for record in group_msgs:
-                try:
-                    await bot.delete_message(
-                        chat_id=record['chat_id'],
-                        message_id=record['message_id']
-                    )
-                    result['group_messages_deleted'] += 1
-                except Exception as e:
-                    logging.warning(
-                        f"Could not delete group msg {record['message_id']} "
-                        f"in chat {record['chat_id']}: {e}"
-                    )
-                    # ✅ Non-fatal — message may already be deleted
+                deleted = await delete_messages(
+                    bot,
+                    record['chat_id'],
+                    [record['message_id']]
+                )
+                result['group_messages_deleted'] += deleted
+                if not deleted:
                     result['errors'].append(
-                        f"Group msg {record['message_id']}: {e}"
+                        f"Group msg {record['message_id']}: delete failed"
                     )
 
             # --------------------------------------------------
@@ -576,21 +572,13 @@ class Design:
         # --------------------------------------------------
         if design.status == DesignStatus.PENDING:
             for reviewer_id, msg_ids in design.all_reviewer_message_pairs():
-                for msg_id in msg_ids:
-                    try:
-                        await bot.delete_message(
-                            chat_id=reviewer_id,
-                            message_id=msg_id
-                        )
-                        result['reviewer_messages_deleted'] += 1
-                    except Exception as e:
-                        logging.warning(
-                            f"Could not delete reviewer msg {msg_id} "
-                            f"from {reviewer_id}: {e}"
-                        )
-                        result['errors'].append(
-                            f"Reviewer msg {msg_id}: {e}"
-                        )
+                deleted = await delete_messages(bot, reviewer_id, msg_ids)
+                result['reviewer_messages_deleted'] += deleted
+                failed = len(msg_ids) - deleted
+                if failed:
+                    result['errors'].append(
+                        f"Reviewer {reviewer_id}: {failed}/{len(msg_ids)} message deletes failed"
+                    )
 
         # --------------------------------------------------
         # 4️⃣ Free locked code
@@ -632,5 +620,3 @@ class Design:
             logging.error(f"Database deletion failed for {code}: {e}")
 
         return result
-        
-        

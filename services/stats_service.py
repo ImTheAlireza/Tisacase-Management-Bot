@@ -13,6 +13,18 @@ def _persian_weekday(dt) -> str:
     return PERSIAN_WEEKDAYS[(dt.weekday() + 2) % 7]
 
 
+def _month_start(dt):
+    """Return the first moment of dt's Gregorian month in the same timezone."""
+    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _previous_month_start(month_start):
+    """Return the first moment of the previous Gregorian month."""
+    if month_start.month == 1:
+        return month_start.replace(year=month_start.year - 1, month=12)
+    return month_start.replace(month=month_start.month - 1)
+
+
 class StatsService:
 
     @staticmethod
@@ -24,9 +36,17 @@ class StatsService:
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             days_since_saturday = (today_start.weekday() + 2) % 7
             week_start = today_start - timedelta(days=days_since_saturday)
+            prev_week_start = week_start - timedelta(days=7)
+            yesterday_start = today_start - timedelta(days=1)
+            month_start = _month_start(today_start)
+            prev_month_start = _previous_month_start(month_start)
 
             today_utc = to_utc_naive(today_start)
+            yesterday_utc = to_utc_naive(yesterday_start)
             week_utc = to_utc_naive(week_start)
+            prev_week_utc = to_utc_naive(prev_week_start)
+            month_utc = to_utc_naive(month_start)
+            prev_month_utc = to_utc_naive(prev_month_start)
 
             # Main aggregation query
             # "all-time" counts respect stats_reset_at; "today"/"week" always show current period
@@ -61,17 +81,67 @@ class StatsService:
                              AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS rejected_week,
 
                     SUM(CASE WHEN d.status != 'deleted'
+                             AND d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                                    AS submitted_prev_week,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                    AS approved_prev_week,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                    AS rejected_prev_week,
+
+                    SUM(CASE WHEN d.status != 'deleted'
+                             AND d.created_at >= %s THEN 1 ELSE 0 END)             AS submitted_month,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS approved_month,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS rejected_month,
+
+                    SUM(CASE WHEN d.status != 'deleted'
+                             AND d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                                    AS submitted_prev_month,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                    AS approved_prev_month,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                    AS rejected_prev_month,
+
+                    SUM(CASE WHEN d.status != 'deleted'
                              AND d.created_at  >= %s THEN 1 ELSE 0 END)            AS submitted_today,
                     SUM(CASE WHEN d.status = 'approved'
                              AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS approved_today,
                     SUM(CASE WHEN d.status = 'rejected'
-                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS rejected_today
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)            AS rejected_today,
+
+                    SUM(CASE WHEN d.status != 'deleted'
+                             AND d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                                    AS submitted_yesterday,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                    AS approved_yesterday,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                    AS rejected_yesterday
 
                 FROM product_lines pl
                 LEFT JOIN designs d ON pl.id = d.product_line_id
                 GROUP BY pl.id, pl.code_prefix, pl.name_fa, pl.icon, pl.is_active, pl.stats_reset_at
                 ORDER BY pl.display_order
-            """, (week_utc, week_utc, week_utc, today_utc, today_utc, today_utc))
+            """, (
+                week_utc, week_utc, week_utc,
+                prev_week_utc, week_utc,
+                prev_week_utc, week_utc,
+                prev_week_utc, week_utc,
+                month_utc, month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                today_utc, today_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc
+            ))
 
             rows = cursor.fetchall()
 
@@ -158,8 +228,17 @@ class StatsService:
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             days_since_saturday = (today_start.weekday() + 2) % 7
             week_start = today_start - timedelta(days=days_since_saturday)
+            prev_week_start = week_start - timedelta(days=7)
+            yesterday_start = today_start - timedelta(days=1)
+            month_start = _month_start(today_start)
+            prev_month_start = _previous_month_start(month_start)
+
             today_utc = to_utc_naive(today_start)
+            yesterday_utc = to_utc_naive(yesterday_start)
             week_utc  = to_utc_naive(week_start)
+            prev_week_utc = to_utc_naive(prev_week_start)
+            month_utc = to_utc_naive(month_start)
+            prev_month_utc = to_utc_naive(prev_month_start)
 
             cursor.execute("""
                 SELECT
@@ -175,17 +254,59 @@ class StatsService:
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS approved_week,
                     SUM(CASE WHEN d.status = 'rejected'
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_week,
+                    SUM(CASE WHEN d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                                 AS submitted_prev_week,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS approved_prev_week,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS rejected_prev_week,
+                    SUM(CASE WHEN d.created_at  >= %s   THEN 1 ELSE 0 END)      AS submitted_month,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS approved_month,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_month,
+                    SUM(CASE WHEN d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                                 AS submitted_prev_month,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS approved_prev_month,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS rejected_prev_month,
                     SUM(CASE WHEN d.created_at  >= %s   THEN 1 ELSE 0 END)      AS submitted_today,
                     SUM(CASE WHEN d.status = 'approved'
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS approved_today,
                     SUM(CASE WHEN d.status = 'rejected'
-                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_today
+                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_today,
+                    SUM(CASE WHEN d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                                 AS submitted_yesterday,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS approved_yesterday,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS rejected_yesterday
                 FROM designs d
                 LEFT JOIN users u ON d.editor_user_id = u.user_id
                 WHERE (u.stats_reset_at IS NULL OR d.created_at >= u.stats_reset_at)
                 GROUP BY d.editor_user_id, d.editor_name
                 ORDER BY submitted_all DESC
-            """, (week_utc, week_utc, week_utc, today_utc, today_utc, today_utc))
+            """, (
+                week_utc, week_utc, week_utc,
+                prev_week_utc, week_utc,
+                prev_week_utc, week_utc,
+                prev_week_utc, week_utc,
+                month_utc, month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                today_utc, today_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc
+            ))
 
             return cursor.fetchall()
         finally:
@@ -201,8 +322,17 @@ class StatsService:
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             days_since_saturday = (today_start.weekday() + 2) % 7
             week_start = today_start - timedelta(days=days_since_saturday)
+            prev_week_start = week_start - timedelta(days=7)
+            yesterday_start = today_start - timedelta(days=1)
+            month_start = _month_start(today_start)
+            prev_month_start = _previous_month_start(month_start)
+
             today_utc = to_utc_naive(today_start)
+            yesterday_utc = to_utc_naive(yesterday_start)
             week_utc  = to_utc_naive(week_start)
+            prev_week_utc = to_utc_naive(prev_week_start)
+            month_utc = to_utc_naive(month_start)
+            prev_month_utc = to_utc_naive(prev_month_start)
 
             cursor.execute("""
                 SELECT
@@ -217,11 +347,40 @@ class StatsService:
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS approved_week,
                     SUM(CASE WHEN d.status = 'rejected'
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_week,
+                    SUM(CASE WHEN d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS reviewed_prev_week,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS approved_prev_week,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS rejected_prev_week,
+                    SUM(CASE WHEN d.reviewed_at >= %s   THEN 1 ELSE 0 END)      AS reviewed_month,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS approved_month,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_month,
+                    SUM(CASE WHEN d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS reviewed_prev_month,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS approved_prev_month,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS rejected_prev_month,
                     SUM(CASE WHEN d.reviewed_at >= %s   THEN 1 ELSE 0 END)      AS reviewed_today,
                     SUM(CASE WHEN d.status = 'approved'
                              AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS approved_today,
                     SUM(CASE WHEN d.status = 'rejected'
-                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_today
+                             AND d.reviewed_at >= %s    THEN 1 ELSE 0 END)      AS rejected_today,
+                    SUM(CASE WHEN d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS reviewed_yesterday,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS approved_yesterday,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                                 AS rejected_yesterday
                 FROM designs d
                 LEFT JOIN users u ON d.reviewer_user_id = u.user_id
                 WHERE d.status IN ('approved', 'rejected')
@@ -229,7 +388,20 @@ class StatsService:
                   AND (u.stats_reset_at IS NULL OR d.reviewed_at >= u.stats_reset_at)
                 GROUP BY d.reviewer_user_id, d.reviewer_name
                 ORDER BY reviewed_all DESC
-            """, (week_utc, week_utc, week_utc, today_utc, today_utc, today_utc))
+            """, (
+                week_utc, week_utc, week_utc,
+                prev_week_utc, week_utc,
+                prev_week_utc, week_utc,
+                prev_week_utc, week_utc,
+                month_utc, month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                today_utc, today_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc
+            ))
 
             return cursor.fetchall()
         finally:
@@ -304,9 +476,15 @@ class StatsService:
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
             now = get_tehran_time()
-            today_utc = to_utc_naive(
-                now.replace(hour=0, minute=0, second=0, microsecond=0)
-            )
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday_start = today_start - timedelta(days=1)
+            month_start = _month_start(today_start)
+            prev_month_start = _previous_month_start(month_start)
+
+            today_utc = to_utc_naive(today_start)
+            yesterday_utc = to_utc_naive(yesterday_start)
+            month_utc = to_utc_naive(month_start)
+            prev_month_utc = to_utc_naive(prev_month_start)
 
             cursor.execute("""
                 SELECT
@@ -314,10 +492,32 @@ class StatsService:
                     SUM(CASE WHEN status = 'pending'  THEN 1 ELSE 0 END) AS pending,
                     SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
                     SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-                    SUM(CASE WHEN created_at >= %s    THEN 1 ELSE 0 END) AS submitted_today
+                    SUM(CASE WHEN created_at >= %s    THEN 1 ELSE 0 END) AS submitted_today,
+                    SUM(CASE WHEN created_at >= %s AND created_at < %s
+                             THEN 1 ELSE 0 END)                         AS submitted_yesterday,
+                    SUM(CASE WHEN created_at >= %s    THEN 1 ELSE 0 END) AS submitted_month,
+                    SUM(CASE WHEN status = 'approved'
+                             AND reviewed_at >= %s THEN 1 ELSE 0 END)   AS approved_month,
+                    SUM(CASE WHEN status = 'rejected'
+                             AND reviewed_at >= %s THEN 1 ELSE 0 END)   AS rejected_month,
+                    SUM(CASE WHEN created_at >= %s AND created_at < %s
+                             THEN 1 ELSE 0 END)                         AS submitted_prev_month,
+                    SUM(CASE WHEN status = 'approved'
+                             AND reviewed_at >= %s AND reviewed_at < %s
+                             THEN 1 ELSE 0 END)                         AS approved_prev_month,
+                    SUM(CASE WHEN status = 'rejected'
+                             AND reviewed_at >= %s AND reviewed_at < %s
+                             THEN 1 ELSE 0 END)                         AS rejected_prev_month
                 FROM designs
                 WHERE status != 'deleted'
-            """, (today_utc,))
+            """, (
+                today_utc,
+                yesterday_utc, today_utc,
+                month_utc, month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc,
+                prev_month_utc, month_utc
+            ))
             totals = cursor.fetchone()
 
             cursor.execute("""
@@ -366,7 +566,9 @@ class StatsService:
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             days_since_saturday = (today_start.weekday() + 2) % 7
             week_start = today_start - timedelta(days=days_since_saturday)
+            yesterday_start = today_start - timedelta(days=1)
             today_utc = to_utc_naive(today_start)
+            yesterday_utc = to_utc_naive(yesterday_start)
             week_utc = to_utc_naive(week_start)
 
             # 1. Today's activity per product line
@@ -377,13 +579,26 @@ class StatsService:
                     SUM(CASE WHEN d.status = 'approved'
                              AND d.reviewed_at >= %s THEN 1 ELSE 0 END)   AS approved_today,
                     SUM(CASE WHEN d.status = 'rejected'
-                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)   AS rejected_today
+                             AND d.reviewed_at >= %s THEN 1 ELSE 0 END)   AS rejected_today,
+                    SUM(CASE WHEN d.created_at >= %s AND d.created_at < %s
+                             THEN 1 ELSE 0 END)                           AS submitted_yesterday,
+                    SUM(CASE WHEN d.status = 'approved'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                           AS approved_yesterday,
+                    SUM(CASE WHEN d.status = 'rejected'
+                             AND d.reviewed_at >= %s AND d.reviewed_at < %s
+                             THEN 1 ELSE 0 END)                           AS rejected_yesterday
                 FROM product_lines pl
                 LEFT JOIN designs d ON pl.id = d.product_line_id
                 WHERE pl.is_active = TRUE
                 GROUP BY pl.id, pl.code_prefix, pl.name_fa, pl.icon
                 ORDER BY pl.display_order
-            """, (today_utc, today_utc, today_utc))
+            """, (
+                today_utc, today_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc,
+                yesterday_utc, today_utc
+            ))
             today_lines = cursor.fetchall()
 
             # 2. Pending codes (still waiting for review)
