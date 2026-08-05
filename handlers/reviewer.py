@@ -535,6 +535,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # ── PRINT FILES → PRINT GROUP ─────────────────────
             unique_prints = list(dict.fromkeys(design.print_file_ids))
             print_count = len(unique_prints)
+            # Caption under each print file: "[product line] - [code]"
+            print_caption = f"{product_line.name_fa} - {code}"
 
             for i, fid in enumerate(unique_prints):
                 label = f"Print {i+1}/{print_count}"
@@ -553,7 +555,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         m = await send_with_retry(
                             lambda: context.bot.send_document(
                                 chat_id=product_line.group_print, document=fid,
-                                caption=f"⚠️ {new_filename} (فایل بزرگ — نام تغییر نکرد)"
+                                caption=f"{print_caption}\n⚠️ {new_filename} (فایل بزرگ — نام تغییر نکرد)"
                             ),
                             label
                         )
@@ -562,7 +564,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         m = await send_with_retry(
                             lambda: context.bot.send_document(
                                 chat_id=product_line.group_print,
-                                document=InputFile(BytesIO(file_bytes), filename=new_filename)
+                                document=InputFile(BytesIO(file_bytes), filename=new_filename),
+                                caption=print_caption
                             ),
                             label
                         )
