@@ -81,7 +81,18 @@ class TestTelegramLogHandler:
                 break
             await original_sleep(0)
 
-        assert bot.send_message.await_count == total
+        # Every record must reach the log group ...
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs['text']
+            for call in bot.send_message.call_args_list
+        ]
+        joined = "\n".join(sent_texts)
+        for i in range(total):
+            assert f'log line {i}' in joined
+
+        # ... but batched into far fewer Telegram messages than records,
+        # so the log chat does not get flooded past Telegram's limit.
+        assert 1 <= bot.send_message.await_count < total
         assert handler.message_queue == []
 
         logger.removeHandler(handler)
@@ -171,4 +182,6 @@ class TestSendMediaWithRetry:
         with pytest.raises(RetryAfter):
             await _send_media_with_retry(send, 'Print 1/1')
 
-        assert sleeps == [2, 2, 2]
+        # One sleep before each of the first two retries; the final attempt
+        # raises immediately without sleeping again.
+        assert sleeps == [2, 2]

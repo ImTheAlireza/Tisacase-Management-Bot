@@ -119,6 +119,29 @@ async def send_with_retry(
     raise RuntimeError(f"{label} failed unexpectedly")
 
 
+async def safe_answer_callback(
+    query,
+    text: Optional[str] = None,
+    show_alert: bool = False,
+) -> bool:
+    """Answer a callback query and never raise.
+
+    Telegram invalidates a callback query after a short window and after it
+    has been answered once; answering a stale/duplicate query raises
+    ``BadRequest: Query is too old and response timeout expired or query id
+    is invalid``. The answer is purely cosmetic (stops the client spinner),
+    so a failed answer must never abort the handler's actual work.
+
+    Returns True when the answer was delivered, False otherwise.
+    """
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+        return True
+    except Exception as e:
+        logging.warning(f"Could not answer callback query: {e}")
+        return False
+
+
 async def delete_messages(bot, chat_id: int, message_ids: list[int]) -> int:
     """Safely delete multiple messages with pacing and 429 retry.
 

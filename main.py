@@ -365,6 +365,14 @@ class TelegramLogHandler(logging.Handler):
     the log group.
     """
     MAX_QUEUE_SIZE = 200
+    # Telegram allows ~20 bot messages per minute per group chat. The old
+    # drain sent one message per record at 0.3s pacing (up to 200 msg/min),
+    # so every burst of logs 429'd the log chat itself and forced multi-second
+    # flood-control waits in the handlers. Batch records into one message and
+    # pace sends to stay under the chat limit.
+    BATCH_MAX_LINES = 15
+    BATCH_MAX_CHARS = 2500
+    SEND_INTERVAL = 3.5
 
     def __init__(self, bot, chat_id):
         super().__init__()
@@ -402,17 +410,31 @@ class TelegramLogHandler(logging.Handler):
 
     async def _process_queue(self):
         while self.message_queue:
-            msg = self.message_queue.pop(0)
-            safe_msg = html.escape(msg[:3000])
+            # Collect one batch: as many queued records as fit in a message.
+            batch = []
+            chars = 0
+            while self.message_queue and len(batch) < self.BATCH_MAX_LINES:
+                msg = self.message_queue[0]
+                if batch and chars + len(msg) > self.BATCH_MAX_CHARS:
+                    break
+                self.message_queue.pop(0)
+                batch.append(msg)
+                chars += len(msg)
+
+            if not batch:
+                continue
+
+            safe_msg = html.escape("\n".join(batch)[:3000])
             try:
                 await self.bot.send_message(
                     self.chat_id,
                     f"ℹ️ Bot Log\n<pre>{safe_msg}</pre>",
                     parse_mode="HTML"
                 )
-                await asyncio.sleep(0.3)
             except RetryAfter as e:
-                # Respect Telegram flood control on the log chat itself.
+                # Respect Telegram flood control on the log chat itself: put
+                # the batch back (do NOT drop it) and wait out the window.
+                self.message_queue[0:0] = batch
                 raw = getattr(e, 'retry_after', 1)
                 if hasattr(raw, 'total_seconds'):  # datetime.timedelta (PTB >= 22)
                     try:
@@ -427,8 +449,11 @@ class TelegramLogHandler(logging.Handler):
                 await asyncio.sleep(wait)
             except Exception:
                 # Never let log delivery crash the bot; drop this single
-                # message and keep draining the rest of the queue.
+                # batch and keep draining the rest of the queue.
                 pass
+            # Pace the next send so the bot stays under the chat's limit
+            # instead of triggering another 429.
+            await asyncio.sleep(self.SEND_INTERVAL)
 
 
 if __name__ == "__main__":
