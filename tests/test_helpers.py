@@ -30,8 +30,8 @@ from utils.helpers import (
     delete_group_message,
     DELETED_BY_BOT_CAPTION,
     DELETED_BY_BOT_TEXT,
-    deleted_marker_caption,
     group_message_link,
+    group_file_label,
 )
 
 
@@ -92,7 +92,7 @@ class TestDeleteGroupMessage:
         bot.edit_message_caption.assert_awaited_once_with(
             chat_id=-100,
             message_id=42,
-            caption=deleted_marker_caption(-100, 42),
+            caption=DELETED_BY_BOT_CAPTION,
             reply_markup=None
         )
 
@@ -152,10 +152,21 @@ class TestGroupMessageLink:
     def test_private_chat_has_no_link(self):
         assert group_message_link(5484684731, 42) is None
 
-    def test_marker_caption_includes_link(self):
-        caption = deleted_marker_caption(-4608593336, 21456)
-        assert caption.startswith(DELETED_BY_BOT_CAPTION)
-        assert "https://t.me/c/4608593336/21456" in caption
+    def test_marker_caption_is_the_new_short_text(self):
+        assert DELETED_BY_BOT_CAPTION == (
+            "🗑❌ این فایل توسط ربات حذف شد. لطفا از این فایل استفاده نشود"
+        )
 
-    def test_marker_caption_without_link_for_private_chat(self):
-        assert deleted_marker_caption(123, 42) == DELETED_BY_BOT_CAPTION
+
+class TestGroupFileLabel:
+
+    def test_single_print_file_has_no_index(self):
+        assert group_file_label('TS001', 'print', 0, 1) == 'TS001'
+
+    def test_multiple_print_files_are_indexed(self):
+        assert group_file_label('TS001', 'print', 0, 2) == 'TS001_1'
+        assert group_file_label('TS001', 'print', 1, 2) == 'TS001_2'
+
+    def test_mockups_are_labeled_with_position(self):
+        assert group_file_label('TS001', 'products', 0, 2) == 'TS001_موکاپ 1'
+        assert group_file_label('TS001', 'products', 1, 2) == 'TS001_موکاپ 2'

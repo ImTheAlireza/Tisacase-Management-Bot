@@ -505,14 +505,14 @@ class Design:
                 'status': str,
                 'group_messages_deleted': int,
                 'group_messages_hidden': int,
-                'hidden_group_refs': list[tuple[int, int]],
+                'hidden_group_refs': list[tuple[int, int, str]],
                 'reviewer_messages_deleted': int,
                 'database_deleted': bool,
                 'errors': list[str]
             }
         """
         from models.design_group_message import DesignGroupMessage
-        from utils.helpers import delete_messages, delete_group_message
+        from utils.helpers import delete_messages, delete_group_message, group_file_label
 
         result = {
             'code': code,
@@ -539,6 +539,11 @@ class Design:
         # --------------------------------------------------
         if design.status == DesignStatus.APPROVED:
             group_msgs = DesignGroupMessage.get_by_code(code)
+            # Print files are named "{code}" (single) or "{code}_{i+1}"
+            # (multiple) when sent to the print group; used for link labels.
+            print_count = sum(
+                1 for r in group_msgs if r['group_type'] == 'print'
+            )
 
             for record in group_msgs:
                 # 'deleted' = fully removed; 'hidden' = older than 48h, so
@@ -553,8 +558,14 @@ class Design:
                     result['group_messages_deleted'] += 1
                 elif outcome == 'hidden':
                     result['group_messages_hidden'] += 1
+                    label = group_file_label(
+                        code,
+                        record['group_type'],
+                        record['file_index'],
+                        print_count
+                    )
                     result['hidden_group_refs'].append(
-                        (record['chat_id'], record['message_id'])
+                        (record['chat_id'], record['message_id'], label)
                     )
                 else:
                     result['errors'].append(

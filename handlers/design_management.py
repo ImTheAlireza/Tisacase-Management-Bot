@@ -397,15 +397,17 @@ async def confirm_delete_callback(
             "روی لینک‌ها بزنید و پیام را دستی حذف کنید:"
         )
         hidden_refs = result.get('hidden_group_refs', [])
-        for chat_id, message_id in hidden_refs[:10]:
+        for chat_id, message_id, label in hidden_refs[:10]:
             link = group_message_link(chat_id, message_id)
             if link:
                 # Raw HTML anchor — must NOT be escaped at send time.
                 result_lines.append(
-                    f'• <a href="{link}">{message_id}</a>'
+                    f'• <a href="{link}">{html.escape(label)}</a>'
                 )
             else:
-                result_lines.append(f"• پیام {message_id} (چت {chat_id})")
+                result_lines.append(
+                    f"• {html.escape(label)} (چت {chat_id})"
+                )
         if len(hidden_refs) > 10:
             result_lines.append(f"… و {len(hidden_refs) - 10} پیام دیگر")
 

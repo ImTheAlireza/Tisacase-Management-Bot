@@ -142,12 +142,8 @@ async def safe_answer_callback(
         return False
 
 
-DELETED_BY_BOT_CAPTION = (
-    "🗑 این پیام توسط ربات حذف شد.\n"
-    "⚠️ تلگرام اجازه حذف کامل پیام‌های قدیمی‌تر از ۴۸ ساعت را به ربات نمی‌دهد — "
-    "برای پاک شدن کامل فایل، ادمین باید این پیام را دستی حذف کند."
-)
-DELETED_BY_BOT_TEXT = "🗑 حذف شده توسط ربات"
+DELETED_BY_BOT_CAPTION = "🗑❌ این فایل توسط ربات حذف شد. لطفا از این فایل استفاده نشود"
+DELETED_BY_BOT_TEXT = "🗑❌ این پیام توسط ربات حذف شد."
 
 
 def group_message_link(chat_id: int, message_id: int) -> str | None:
@@ -166,16 +162,17 @@ def group_message_link(chat_id: int, message_id: int) -> str | None:
     return f"https://t.me/c/{cid}/{message_id}"
 
 
-def deleted_marker_caption(chat_id: int, message_id: int) -> str:
-    """Marker caption for a group message the bot could not delete.
+def group_file_label(code: str, group_type: str, file_index: int, print_count: int) -> str:
+    """Human-readable label for a group message in deletion reports.
 
-    Includes a plain-text t.me link so anyone in the group (or the admin
-    reading the report) can tap straight to the message and remove it.
+    Print files are named "{code}" (single) or "{code}_{i+1}" (multiple)
+    when sent to the print group; mockups are labeled by their position.
     """
-    link = group_message_link(chat_id, message_id)
-    if link:
-        return f"{DELETED_BY_BOT_CAPTION}\n\n🔗 {link}"
-    return DELETED_BY_BOT_CAPTION
+    if group_type == 'print':
+        if print_count == 1:
+            return code
+        return f"{code}_{file_index + 1}"
+    return f"{code}_موکاپ {file_index + 1}"
 
 
 async def _mark_message_deleted(bot, chat_id: int, message_id: int) -> bool:
@@ -189,7 +186,7 @@ async def _mark_message_deleted(bot, chat_id: int, message_id: int) -> bool:
         await bot.edit_message_caption(
             chat_id=chat_id,
             message_id=message_id,
-            caption=deleted_marker_caption(chat_id, message_id),
+            caption=DELETED_BY_BOT_CAPTION,
             reply_markup=None
         )
         return True
