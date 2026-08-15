@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import time
+import html
 from typing import Optional
 
 from telegram import (
@@ -15,7 +16,7 @@ from models.design import Design
 from models.product_line import ProductLine
 from models.design_group_message import DesignGroupMessage
 from models.user import User
-from utils.helpers import safe_edit_message, delete_messages, format_datetime_persian, safe_answer_callback
+from utils.helpers import safe_edit_message, delete_messages, format_datetime_persian, safe_answer_callback, group_message_link
 from utils.enums import DesignStatus
 from utils.callback_lock import deduplicate_callback
 
@@ -385,17 +386,28 @@ async def confirm_delete_callback(
 
     # Messages older than 48h: Telegram does not allow bots to delete them
     # for everyone — we could only replace their captions with a marker.
+    # Give clickable links so the message can be opened and removed by hand.
     if result.get('group_messages_hidden'):
         result_lines.append(
             f"\n⚠️ {result['group_messages_hidden']} پیام قدیمی‌تر از ۴۸ ساعت بود "
             "و تلگرام اجازه حذف کامل آن را به ربات نمی‌دهد."
         )
         result_lines.append(
-            "کپشن آن‌ها به «🗑 حذف‌شده» تغییر کرد. برای پاک شدن کامل فایل، "
-            "ادمین باید دستی حذف کند:"
+            "کپشن آن‌ها به «🗑 حذف‌شده» تغییر کرد. برای پاک شدن کامل، "
+            "روی لینک‌ها بزنید و پیام را دستی حذف کنید:"
         )
-        for ref in result.get('hidden_group_refs', [])[:5]:
-            result_lines.append(f"• {ref}")
+        hidden_refs = result.get('hidden_group_refs', [])
+        for chat_id, message_id in hidden_refs[:10]:
+            link = group_message_link(chat_id, message_id)
+            if link:
+                # Raw HTML anchor — must NOT be escaped at send time.
+                result_lines.append(
+                    f'• <a href="{link}">{message_id}</a>'
+                )
+            else:
+                result_lines.append(f"• chat={chat_id} msg={message_id}")
+        if len(hidden_refs) > 10:
+            result_lines.append(f"… و {len(hidden_refs) - 10} پیام دیگر")
 
     # Show non-fatal errors with details (e.g. messages already deleted)
     if result['errors']:
@@ -404,9 +416,16 @@ async def confirm_delete_callback(
             + "\n".join(f"• {e}" for e in result['errors'][:5])
         )
 
+    # The result is sent with HTML parse mode for the t.me links; escape
+    # every plain line and keep the pre-built anchor lines raw.
+    html_lines = [
+        line if line.startswith('• <a href="') else html.escape(line)
+        for line in result_lines
+    ]
     await context.bot.send_message(
         chat_id=query.from_user.id,
-        text='\n'.join(result_lines)
+        text='\n'.join(html_lines),
+        parse_mode='HTML'
     )
 
     # Notify sudo about errors (non-fatal)

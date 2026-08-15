@@ -505,7 +505,7 @@ class Design:
                 'status': str,
                 'group_messages_deleted': int,
                 'group_messages_hidden': int,
-                'hidden_group_refs': list[str],
+                'hidden_group_refs': list[tuple[int, int]],
                 'reviewer_messages_deleted': int,
                 'database_deleted': bool,
                 'errors': list[str]
@@ -554,7 +554,7 @@ class Design:
                 elif outcome == 'hidden':
                     result['group_messages_hidden'] += 1
                     result['hidden_group_refs'].append(
-                        f"chat={record['chat_id']} msg={record['message_id']}"
+                        (record['chat_id'], record['message_id'])
                     )
                 else:
                     result['errors'].append(

@@ -30,6 +30,8 @@ from utils.helpers import (
     delete_group_message,
     DELETED_BY_BOT_CAPTION,
     DELETED_BY_BOT_TEXT,
+    deleted_marker_caption,
+    group_message_link,
 )
 
 
@@ -90,7 +92,7 @@ class TestDeleteGroupMessage:
         bot.edit_message_caption.assert_awaited_once_with(
             chat_id=-100,
             message_id=42,
-            caption=DELETED_BY_BOT_CAPTION,
+            caption=deleted_marker_caption(-100, 42),
             reply_markup=None
         )
 
@@ -132,3 +134,28 @@ class TestDeleteGroupMessage:
         assert await delete_group_message(bot, -100, 42) == 'failed'
         bot.edit_message_caption.assert_not_awaited()
         bot.edit_message_text.assert_not_awaited()
+
+
+class TestGroupMessageLink:
+
+    def test_basic_group_link(self):
+        # Real production ids: basic groups have no -100 prefix.
+        assert group_message_link(-4608593336, 21456) == (
+            "https://t.me/c/4608593336/21456"
+        )
+
+    def test_supergroup_link_strips_100_prefix(self):
+        assert group_message_link(-1002140742633, 7) == (
+            "https://t.me/c/2140742633/7"
+        )
+
+    def test_private_chat_has_no_link(self):
+        assert group_message_link(5484684731, 42) is None
+
+    def test_marker_caption_includes_link(self):
+        caption = deleted_marker_caption(-4608593336, 21456)
+        assert caption.startswith(DELETED_BY_BOT_CAPTION)
+        assert "https://t.me/c/4608593336/21456" in caption
+
+    def test_marker_caption_without_link_for_private_chat(self):
+        assert deleted_marker_caption(123, 42) == DELETED_BY_BOT_CAPTION

@@ -150,6 +150,34 @@ DELETED_BY_BOT_CAPTION = (
 DELETED_BY_BOT_TEXT = "🗑 حذف شده توسط ربات"
 
 
+def group_message_link(chat_id: int, message_id: int) -> str | None:
+    """Build a t.me link to a group message (None for private chats).
+
+    Works for basic groups (id like -4608593336) and supergroups
+    (id like -1001234567890): the link is t.me/c/<id>/<message_id>,
+    with the supergroup '100' prefix stripped.
+    """
+    if chat_id >= 0:
+        return None
+    cid = abs(chat_id)
+    cid_str = str(cid)
+    if cid_str.startswith('100') and len(cid_str) >= 10:
+        cid = int(cid_str[3:])
+    return f"https://t.me/c/{cid}/{message_id}"
+
+
+def deleted_marker_caption(chat_id: int, message_id: int) -> str:
+    """Marker caption for a group message the bot could not delete.
+
+    Includes a plain-text t.me link so anyone in the group (or the admin
+    reading the report) can tap straight to the message and remove it.
+    """
+    link = group_message_link(chat_id, message_id)
+    if link:
+        return f"{DELETED_BY_BOT_CAPTION}\n\n🔗 {link}"
+    return DELETED_BY_BOT_CAPTION
+
+
 async def _mark_message_deleted(bot, chat_id: int, message_id: int) -> bool:
     """Edit a message to a deletion marker (best-effort).
 
@@ -161,7 +189,7 @@ async def _mark_message_deleted(bot, chat_id: int, message_id: int) -> bool:
         await bot.edit_message_caption(
             chat_id=chat_id,
             message_id=message_id,
-            caption=DELETED_BY_BOT_CAPTION,
+            caption=deleted_marker_caption(chat_id, message_id),
             reply_markup=None
         )
         return True
