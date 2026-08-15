@@ -32,6 +32,7 @@ from migrations.migration_006_create_design_group_messages import Migration006
 from migrations.migration_007_add_deleted_status import Migration007
 from migrations.migration_008_add_stats_reset import Migration008
 from migrations.migration_009_add_file_types import Migration009
+from migrations.migration_010_create_userbot_deletion_queue import Migration010
 
 # Handlers
 from handlers.common import start_command, cancel_command
@@ -42,6 +43,7 @@ from handlers.sudo import (
     handle_group_id_input, status_command, broadcast_update_callback,
     delete_design_command, confirm_delete_design_callback,
     cleanup_orphans_command, confirm_restore_callback,
+    userbot_queue_command,
     backup_type_callback, csv_range_callback
 )
 from handlers.reset_stats import reset_stats_command, reset_stats_callback
@@ -137,7 +139,7 @@ def run_db_migrations():
     migrations = [
         Migration001(), Migration002(), Migration003(),
         Migration004(), Migration005(), Migration006(),
-        Migration007(), Migration008(), Migration009()
+        Migration007(), Migration008(), Migration009(), Migration010()
     ]
     manager = MigrationManager()
     manager.run_migrations(migrations)
@@ -499,6 +501,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("designinfo",    design_info_command))
     application.add_handler(CommandHandler("deletedesign",  delete_design_command))
     application.add_handler(CommandHandler("cleanup",       cleanup_orphans_command))
+    application.add_handler(CommandHandler("userbotqueue",  userbot_queue_command))
 
     # -----------------------------------------------------------------------
     # Text routing & Files

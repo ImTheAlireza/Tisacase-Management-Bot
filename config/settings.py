@@ -42,6 +42,19 @@ DEFAULT_PRODUCT_LINES = [
     }
 ]
 
+# ==================== USERBOT BRIDGE (optional) ====================
+# Telethon self-bot worker (userbot/delete_worker.py) that deletes old
+# group messages on behalf of the owner's user account. All optional.
+USERBOT_API_ID = os.getenv('USERBOT_API_ID')
+USERBOT_API_HASH = os.getenv('USERBOT_API_HASH')
+USERBOT_SESSION = os.getenv('USERBOT_SESSION')
+USERBOT_SESSION_FILE = os.getenv('USERBOT_SESSION_FILE')
+USERBOT_POLL_INTERVAL = float(os.getenv('USERBOT_POLL_INTERVAL', '5'))
+USERBOT_BATCH_SIZE = int(os.getenv('USERBOT_BATCH_SIZE', '25'))
+USERBOT_DELETE_PACE = float(os.getenv('USERBOT_DELETE_PACE', '2.0'))
+USERBOT_MAX_ATTEMPTS = int(os.getenv('USERBOT_MAX_ATTEMPTS', '5'))
+USERBOT_STALE_MINUTES = int(os.getenv('USERBOT_STALE_MINUTES', '15'))
+
 # ==================== VALIDATION ====================
 required_env_vars = [
     'MAIN_BOT_TOKEN',

@@ -384,18 +384,25 @@ async def confirm_delete_callback(
     ]
 
     # Messages older than 48h: Telegram does not allow bots to delete them
-    # for everyone — we could only replace their captions with a marker.
+    # for everyone. They are handed to the userbot worker (user account has
+    # no 48h limit); anything it could not receive needs a manual delete.
     if result.get('group_messages_hidden'):
+        queued = result.get('userbot_queued', 0)
         result_lines.append(
             f"\n⚠️ {result['group_messages_hidden']} پیام قدیمی‌تر از ۴۸ ساعت بود "
             "و تلگرام اجازه حذف کامل آن را به ربات نمی‌دهد."
         )
-        result_lines.append(
-            "کپشن آن‌ها به «🗑 حذف‌شده» تغییر کرد. برای پاک شدن کامل فایل، "
-            "ادمین باید دستی حذف کند:"
-        )
-        for ref in result.get('hidden_group_refs', [])[:5]:
-            result_lines.append(f"• {ref}")
+        if queued:
+            result_lines.append(
+                f"🤖 {queued} پیام برای حذف خودکار به یوزربات سپرده شد."
+            )
+        manual_count = result['group_messages_hidden'] - queued
+        if manual_count > 0:
+            result_lines.append(
+                f"✋ {manual_count} پیام وارد صف نشد و باید دستی حذف شود:"
+            )
+            for ref in result.get('hidden_group_refs', [])[:5]:
+                result_lines.append(f"• {ref}")
 
     # Show non-fatal errors with details (e.g. messages already deleted)
     if result['errors']:
