@@ -142,6 +142,87 @@ async def safe_answer_callback(
         return False
 
 
+DELETED_BY_BOT_CAPTION = (
+    "🗑 این پیام توسط ربات حذف شد.\n"
+    "⚠️ تلگرام اجازه حذف کامل پیام‌های قدیمی‌تر از ۴۸ ساعت را به ربات نمی‌دهد — "
+    "برای پاک شدن کامل فایل، ادمین باید این پیام را دستی حذف کند."
+)
+DELETED_BY_BOT_TEXT = "🗑 حذف شده توسط ربات"
+
+
+async def _mark_message_deleted(bot, chat_id: int, message_id: int) -> bool:
+    """Edit a message to a deletion marker (best-effort).
+
+    Bots can edit their own messages regardless of age, so when a full
+    delete is impossible this at least hides the caption and signals the
+    message is obsolete. Returns True when any edit succeeded.
+    """
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=DELETED_BY_BOT_CAPTION,
+            reply_markup=None
+        )
+        return True
+    except Exception:
+        pass
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=DELETED_BY_BOT_TEXT,
+            reply_markup=None
+        )
+        return True
+    except Exception as e:
+        logging.warning(
+            f"Could not edit message {message_id} in chat {chat_id}: {e}"
+        )
+        return False
+
+
+async def delete_group_message(bot, chat_id: int, message_id: int) -> str:
+    """Delete one group message for everyone, with a fallback for old messages.
+
+    Telegram hard-limits bot deletions to messages sent less than 48 hours
+    ago; older messages raise ``BadRequest: message can't be deleted for
+    everyone`` and NO bot-side API call can fully remove them (this limit
+    applies even in supergroups). Editing has no age limit, so as a fallback
+    we edit the message to a deletion marker to hide its caption and flag it
+    for manual removal by a human admin.
+
+    Returns one of:
+        'deleted' — message fully deleted for everyone.
+        'hidden'  — too old to delete; caption/content replaced with a
+                    deletion marker (human admin can still remove the file).
+        'failed'  — deletion failed for another reason (no rights, 429
+                    exhausted, ...) and the marker edit also failed.
+    """
+    try:
+        await send_with_retry(
+            lambda: bot.delete_message(chat_id=chat_id, message_id=message_id),
+            f"Delete message {message_id} in chat {chat_id}"
+        )
+        return 'deleted'
+    except Exception as e:
+        error_text = str(e).lower()
+        if "can't be deleted" not in error_text:
+            logging.warning(
+                f"Delete message {message_id} in chat {chat_id} failed: {e}"
+            )
+            return 'failed'
+
+        logging.info(
+            f"Message {message_id} in chat {chat_id} is older than 48h — "
+            "Telegram refuses bot deletion; editing to a deletion marker"
+        )
+        if await _mark_message_deleted(bot, chat_id, message_id):
+            return 'hidden'
+        return 'failed'
+
+
 async def delete_messages(bot, chat_id: int, message_ids: list[int]) -> int:
     """Safely delete multiple messages with pacing and 429 retry.
 

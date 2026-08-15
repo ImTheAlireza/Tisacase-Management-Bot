@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 from models.design import Design
 from models.user import User
 from models.product_line import ProductLine
-from utils.helpers import format_datetime_persian
+from utils.helpers import format_datetime_persian, safe_answer_callback
 from utils.enums import DesignStatus
 from config.settings import TELEGRAM_SEND_DELAY
 
@@ -173,7 +173,7 @@ async def _show_my_designs(update: Update, context: ContextTypes.DEFAULT_TYPE, u
 async def my_designs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle my designs callbacks."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data = query.data
 
@@ -216,12 +216,12 @@ async def _show_design_detail(update: Update, context: ContextTypes.DEFAULT_TYPE
     design = Design.get_by_code(code)
 
     if not design:
-        await update.callback_query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(update.callback_query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     # Verify ownership
     if design.editor_user_id != update.callback_query.from_user.id:
-        await update.callback_query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
+        await safe_answer_callback(update.callback_query, "🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
     # ✅ product line may be missing/deactivated — never dereference blindly,
@@ -288,14 +288,12 @@ async def _start_edit_design(update: Update, context: ContextTypes.DEFAULT_TYPE,
     design = Design.get_by_code(code)
 
     if not design:
-        await update.callback_query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(update.callback_query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     if not design.can_be_edited_by(update.callback_query.from_user.id):
-        await update.callback_query.answer(
-            "⚠️ فقط طرح‌های در انتظار را می‌توان ویرایش کرد",
-            show_alert=True
-        )
+        await safe_answer_callback(update.callback_query, "⚠️ فقط طرح‌های در انتظار را می‌توان ویرایش کرد",
+            show_alert=True)
         return
 
     # Load design into editor
@@ -307,15 +305,15 @@ async def _confirm_delete_design(update: Update, context: ContextTypes.DEFAULT_T
     design = Design.get_by_code(code)
 
     if not design:
-        await update.callback_query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(update.callback_query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     if design.editor_user_id != update.callback_query.from_user.id:
-        await update.callback_query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
+        await safe_answer_callback(update.callback_query, "🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
     if design.status != DesignStatus.PENDING:
-        await update.callback_query.answer("⚠️ فقط طرح‌های در انتظار قابل حذف هستند", show_alert=True)
+        await safe_answer_callback(update.callback_query, "⚠️ فقط طرح‌های در انتظار قابل حذف هستند", show_alert=True)
         return
 
     # ✅ A missing product line must not block deletion — otherwise a design
@@ -349,15 +347,15 @@ async def _execute_delete_design(update: Update, context: ContextTypes.DEFAULT_T
     design = Design.get_by_code(code)
 
     if not design:
-        await query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     if design.editor_user_id != query.from_user.id:
-        await query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
+        await safe_answer_callback(query, "🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
     if design.status != DesignStatus.PENDING:
-        await query.answer("⚠️ فقط طرح‌های در انتظار قابل حذف هستند", show_alert=True)
+        await safe_answer_callback(query, "⚠️ فقط طرح‌های در انتظار قابل حذف هستند", show_alert=True)
         return
 
     # Delete the design completely
@@ -381,11 +379,11 @@ async def _send_design_files(update: Update, context: ContextTypes.DEFAULT_TYPE,
     design = Design.get_by_code(code)
 
     if not design:
-        await query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     if design.editor_user_id != query.from_user.id:
-        await query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
+        await safe_answer_callback(query, "🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
     user_id = query.from_user.id
@@ -445,21 +443,21 @@ async def _handle_resubmit(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     design = Design.get_by_code(code)
 
     if not design:
-        await query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     if design.editor_user_id != query.from_user.id:
-        await query.answer("🚫 این طرح متعلق به شما نیست", show_alert=True)
+        await safe_answer_callback(query, "🚫 این طرح متعلق به شما نیست", show_alert=True)
         return
 
     if design.status != DesignStatus.REJECTED:
-        await query.answer("⚠️ فقط طرح‌های رد شده قابل ثبت مجدد هستند", show_alert=True)
+        await safe_answer_callback(query, "⚠️ فقط طرح‌های رد شده قابل ثبت مجدد هستند", show_alert=True)
         return
 
     # Try to generate a new code for the same product line
     product_line = ProductLine.get_by_id(design.product_line_id)
     if not product_line:
-        await query.answer("❌ خط تولید یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ خط تولید یافت نشد", show_alert=True)
         return
 
     user = User.get_by_id(query.from_user.id)
@@ -473,10 +471,8 @@ async def _handle_resubmit(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         )
     except Exception as e:
         logging.error(f"Resubmit code generation failed for {code}: {e}")
-        await query.answer(
-            f"❌ خطا: کد جدید قابل تولید نیست.\n{str(e)[:100]}",
-            show_alert=True
-        )
+        await safe_answer_callback(query, f"❌ خطا: کد جدید قابل تولید نیست.\n{str(e)[:100]}",
+            show_alert=True)
         return
 
     # Copy files from old design to new design

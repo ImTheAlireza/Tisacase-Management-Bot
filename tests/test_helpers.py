@@ -19,12 +19,18 @@ os.environ.setdefault('MAIN_DB_USER', 'root')
 os.environ.setdefault('MAIN_DB_PASSWORD', '')
 os.environ.setdefault('MAIN_DB_NAME', 'tisa_test')
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 from telegram.error import BadRequest
 
-from utils.helpers import safe_answer_callback
+from utils.helpers import (
+    safe_answer_callback,
+    delete_group_message,
+    DELETED_BY_BOT_CAPTION,
+    DELETED_BY_BOT_TEXT,
+)
 
 
 class TestSafeAnswerCallback:
@@ -50,3 +56,79 @@ class TestSafeAnswerCallback:
         query = AsyncMock()
         query.answer.side_effect = RuntimeError("network gone")
         assert await safe_answer_callback(query) is False
+
+
+class TestDeleteGroupMessage:
+
+    async def _fast_sleep(self, monkeypatch):
+        original_sleep = asyncio.sleep
+
+        async def _no_delay(_):
+            await original_sleep(0)
+
+        monkeypatch.setattr('utils.helpers.asyncio.sleep', _no_delay)
+
+    @pytest.mark.asyncio
+    async def test_deletes_recent_message(self, monkeypatch):
+        await self._fast_sleep(monkeypatch)
+        bot = AsyncMock()
+        bot.delete_message = AsyncMock(return_value=True)
+        assert await delete_group_message(bot, -100, 42) == 'deleted'
+        bot.delete_message.assert_awaited_once_with(chat_id=-100, message_id=42)
+        bot.edit_message_caption.assert_not_awaited()
+        bot.edit_message_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_old_message_is_hidden_via_caption_edit(self, monkeypatch):
+        await self._fast_sleep(monkeypatch)
+        bot = AsyncMock()
+        bot.delete_message = AsyncMock(side_effect=BadRequest(
+            "Message can't be deleted for everyone"
+        ))
+        bot.edit_message_caption = AsyncMock(return_value=True)
+        assert await delete_group_message(bot, -100, 42) == 'hidden'
+        bot.edit_message_caption.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=42,
+            caption=DELETED_BY_BOT_CAPTION,
+            reply_markup=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_message_hidden_via_text_edit_when_caption_edit_fails(
+        self, monkeypatch
+    ):
+        await self._fast_sleep(monkeypatch)
+        bot = AsyncMock()
+        bot.delete_message = AsyncMock(side_effect=BadRequest(
+            "Message can't be deleted for everyone"
+        ))
+        bot.edit_message_caption = AsyncMock(side_effect=BadRequest("no caption"))
+        bot.edit_message_text = AsyncMock(return_value=True)
+        assert await delete_group_message(bot, -100, 42) == 'hidden'
+        bot.edit_message_text.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=42,
+            text=DELETED_BY_BOT_TEXT,
+            reply_markup=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_old_message_fails_when_no_edit_works(self, monkeypatch):
+        await self._fast_sleep(monkeypatch)
+        bot = AsyncMock()
+        bot.delete_message = AsyncMock(side_effect=BadRequest(
+            "Message can't be deleted for everyone"
+        ))
+        bot.edit_message_caption = AsyncMock(side_effect=BadRequest("nope"))
+        bot.edit_message_text = AsyncMock(side_effect=BadRequest("nope"))
+        assert await delete_group_message(bot, -100, 42) == 'failed'
+
+    @pytest.mark.asyncio
+    async def test_other_errors_do_not_attempt_edit(self, monkeypatch):
+        await self._fast_sleep(monkeypatch)
+        bot = AsyncMock()
+        bot.delete_message = AsyncMock(side_effect=RuntimeError("boom"))
+        assert await delete_group_message(bot, -100, 42) == 'failed'
+        bot.edit_message_caption.assert_not_awaited()
+        bot.edit_message_text.assert_not_awaited()

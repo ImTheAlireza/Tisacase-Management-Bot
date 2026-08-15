@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 from config.settings import SUDO_USER_ID
 from utils.decorators import require_sudo
 from utils.callback_lock import deduplicate_callback
+from utils.helpers import safe_answer_callback
 
 
 def _server_bill_key(update, context) -> str:
@@ -18,7 +19,7 @@ def _server_bill_key(update, context) -> str:
 @deduplicate_callback(_server_bill_key)
 async def server_bill_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     if query.data == "server_bill_paid":
         # Mark as paid in bot_data (in-memory for immediate effect)

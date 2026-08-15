@@ -16,7 +16,7 @@ from telegram.ext import (
 
 # Configuration & Infrastructure
 from config.settings import BOT_TOKEN, BACKUP_TIME_HOUR, BACKUP_TIME_MINUTE, LOG_LEVEL, LOG_FORMAT, LOG_GROUP_ID, SERVER_BILL_REMINDER_HOUR, SERVER_BILL_REMINDER_MINUTE
-from utils.helpers import get_tehran_time, TEHRAN_TZ
+from utils.helpers import get_tehran_time, TEHRAN_TZ, safe_answer_callback
 from config.database import test_connection, init_legacy_tables
 from services.backup_service import BackupService, send_daily_backup
 from services.code_service import CodeService
@@ -115,7 +115,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         user_msg = "❌ خطای داخلی رخ داد. تیم فنی در جریان قرار گرفت."
         try:
             if update.callback_query:
-                await update.callback_query.answer(user_msg, show_alert=True)
+                await safe_answer_callback(update.callback_query, user_msg, show_alert=True)
             elif update.message:
                 await update.message.reply_text(user_msg)
         except Exception:
@@ -307,17 +307,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward the daily log message to a reviewer when sudo taps the button"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     from config.settings import SUDO_USER_ID
     if query.from_user.id != SUDO_USER_ID:
-        await query.answer("🚫 فقط Sudo", show_alert=True)
+        await safe_answer_callback(query, "🚫 فقط Sudo", show_alert=True)
         return
 
     target_user_id = int(query.data.split('_')[1])
     target_user = User.get_by_id(target_user_id)
     if not target_user:
-        await query.answer("❌ کاربر یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ کاربر یافت نشد", show_alert=True)
         return
 
     try:
@@ -326,10 +326,10 @@ async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_chat_id=query.message.chat_id,
             message_id=query.message.message_id
         )
-        await query.answer(f"✅ ارسال شد به {target_user.first_name}")
+        await safe_answer_callback(query, f"✅ ارسال شد به {target_user.first_name}")
     except Exception as e:
         logging.error(f"Failed to forward log to {target_user_id}: {e}")
-        await query.answer("❌ ارسال ناموفق", show_alert=True)
+        await safe_answer_callback(query, "❌ ارسال ناموفق", show_alert=True)
 
 
 async def send_startup_notification(context: ContextTypes.DEFAULT_TYPE):

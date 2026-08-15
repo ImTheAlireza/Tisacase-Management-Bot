@@ -16,7 +16,7 @@ from telegram.ext import ContextTypes
 from utils.decorators import require_role
 from utils.state_manager import StateManager
 from utils.enums import DesignStatus, EditorStage
-from utils.helpers import safe_edit_message, delete_messages, send_with_retry
+from utils.helpers import safe_edit_message, delete_messages, send_with_retry, safe_answer_callback
 from utils.callback_lock import deduplicate_callback
 from services.code_service import CodeService
 from models.product_line import ProductLine
@@ -218,10 +218,8 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Verify design can be edited
     if not design.can_be_edited_by(user_id):
-        await update.callback_query.answer(
-            "⚠️ فقط طرح‌های در انتظار را می‌توان ویرایش کرد",
-            show_alert=True
-        )
+        await safe_answer_callback(update.callback_query, "⚠️ فقط طرح‌های در انتظار را می‌توان ویرایش کرد",
+            show_alert=True)
         return
 
     # Cleanup any existing session
@@ -269,10 +267,8 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except Exception as e:
         logging.error(f"Failed to load design for edit: {e}")
-        await update.callback_query.answer(
-            "❌ خطا در بارگذاری طرح",
-            show_alert=True
-        )
+        await safe_answer_callback(update.callback_query, "❌ خطا در بارگذاری طرح",
+            show_alert=True)
 
 
 @require_role('editor', 'sudo', rate_limit_action='code_generation')
@@ -471,7 +467,7 @@ async def editor_callbacks(
     Central callback handler for all editor stage transitions.
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data: str = query.data
     chat_id: int = query.from_user.id
@@ -590,10 +586,8 @@ async def _handle_mockup_done(query, context, chat_id: int) -> None:
     mockups = context.user_data.get('mockup_files', [])
 
     if not mockups:
-        await query.answer(
-            "❌ حداقل یک موکاپ باید ارسال شود",
-            show_alert=True
-        )
+        await safe_answer_callback(query, "❌ حداقل یک موکاپ باید ارسال شود",
+            show_alert=True)
         return
 
     # Move to print stage
@@ -606,10 +600,8 @@ async def _handle_print_done(query, context, chat_id: int) -> None:
     prints = context.user_data.get('print_files', [])
 
     if not prints:
-        await query.answer(
-            "❌ حداقل یک فایل چاپی باید ارسال شود",
-            show_alert=True
-        )
+        await safe_answer_callback(query, "❌ حداقل یک فایل چاپی باید ارسال شود",
+            show_alert=True)
         return
 
     # Move to confirm stage
@@ -623,11 +615,11 @@ async def _handle_confirm_submit(query, context, chat_id: int) -> None:
     prints  = context.user_data.get('print_files', [])
 
     if not mockups:
-        await query.answer("❌ حداقل یک موکاپ باید ارسال شود", show_alert=True)
+        await safe_answer_callback(query, "❌ حداقل یک موکاپ باید ارسال شود", show_alert=True)
         return
 
     if not prints:
-        await query.answer("❌ حداقل یک فایل چاپی باید ارسال شود", show_alert=True)
+        await safe_answer_callback(query, "❌ حداقل یک فایل چاپی باید ارسال شود", show_alert=True)
         return
 
     context.user_data['stage'] = EditorStage.CONFIRM
@@ -670,7 +662,7 @@ async def _handle_remove_file(query, context, chat_id: int, stage: str, index: i
     files = context.user_data.get(files_key, [])
 
     if index < 0 or index >= len(files):
-        await query.answer("❌ فایل یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ فایل یافت نشد", show_alert=True)
         return
 
     removed = files.pop(index)
@@ -696,7 +688,7 @@ async def _handle_remove_file(query, context, chat_id: int, stage: str, index: i
         logging.warning(f"Could not edit for file removal: {e}")
 
     stage_label = "موکاپ" if stage == "mockup" else "فایل چاپی"
-    await query.answer(f"❌ {stage_label} {index + 1} حذف شد")
+    await safe_answer_callback(query, f"❌ {stage_label} {index + 1} حذف شد")
 
 
 async def _notify_reviewers_of_edit(bot, design: Design) -> None:
@@ -808,7 +800,7 @@ async def _handle_preview_files(query, context, chat_id: int) -> None:
     prints  = context.user_data.get('print_files', [])
     code    = context.user_data.get('code', '')
 
-    await query.answer()
+    await safe_answer_callback(query)
 
     # Send mockups as media group (chunked to Telegram's 10-item limit)
     if mockups:
@@ -922,10 +914,8 @@ async def _handle_submit_to_reviewer(
 
     # Final validation
     if not mockups or not prints:
-        await query.answer(
-            "❌ لطفا حداقل یک موکاپ و یک فایل چاپی بفرستید.",
-            show_alert=True
-        )
+        await safe_answer_callback(query, "❌ لطفا حداقل یک موکاپ و یک فایل چاپی بفرستید.",
+            show_alert=True)
         return
 
     editing_mode = context.user_data.get('editing_existing', False)

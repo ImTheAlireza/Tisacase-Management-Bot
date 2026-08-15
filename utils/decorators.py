@@ -3,6 +3,7 @@ from typing import Callable
 from models.user import User
 from utils.rate_limiter import rate_limiter
 import logging
+from utils.helpers import safe_answer_callback
 
 
 def require_role(*allowed_roles: str, rate_limit_action: str = None) -> Callable:
@@ -25,7 +26,7 @@ def require_role(*allowed_roles: str, rate_limit_action: str = None) -> Callable
                 if update.message:
                     await update.message.reply_text("🚫 شما مجاز به استفاده از این ربات نیستید.")
                 elif update.callback_query:
-                    await update.callback_query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+                    await safe_answer_callback(update.callback_query, "🚫 دسترسی غیرمجاز", show_alert=True)
                 return
 
             effective_role: str = user.get_effective_role()
@@ -35,7 +36,7 @@ def require_role(*allowed_roles: str, rate_limit_action: str = None) -> Callable
                 if update.message:
                     await update.message.reply_text(msg)
                 elif update.callback_query:
-                    await update.callback_query.answer(msg, show_alert=True)
+                    await safe_answer_callback(update.callback_query, msg, show_alert=True)
                 return
 
             # Rate limiting (skip for sudo users)
@@ -46,7 +47,7 @@ def require_role(*allowed_roles: str, rate_limit_action: str = None) -> Callable
                     if update.message:
                         await update.message.reply_text(msg)
                     elif update.callback_query:
-                        await update.callback_query.answer(msg, show_alert=True)
+                        await safe_answer_callback(update.callback_query, msg, show_alert=True)
                     return
 
             context.user_data['db_user'] = user
@@ -69,14 +70,14 @@ def require_sudo(func: Callable) -> Callable:
             if update.message:
                 await update.message.reply_text("🚫 شما مجاز به استفاده از این ربات نیستید.")
             elif update.callback_query:
-                await update.callback_query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+                await safe_answer_callback(update.callback_query, "🚫 دسترسی غیرمجاز", show_alert=True)
             return
 
         if not user.is_sudo:
             if update.message:
                 await update.message.reply_text("🚫 این بخش فقط برای Sudo است.")
             elif update.callback_query:
-                await update.callback_query.answer("🚫 فقط Sudo", show_alert=True)
+                await safe_answer_callback(update.callback_query, "🚫 فقط Sudo", show_alert=True)
             return
 
         context.user_data['db_user'] = user

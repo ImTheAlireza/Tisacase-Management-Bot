@@ -504,18 +504,22 @@ class Design:
                 'code': str,
                 'status': str,
                 'group_messages_deleted': int,
+                'group_messages_hidden': int,
+                'hidden_group_refs': list[str],
                 'reviewer_messages_deleted': int,
                 'database_deleted': bool,
                 'errors': list[str]
             }
         """
         from models.design_group_message import DesignGroupMessage
-        from utils.helpers import delete_messages
+        from utils.helpers import delete_messages, delete_group_message
 
         result = {
             'code': code,
             'status': 'not_found',
             'group_messages_deleted': 0,
+            'group_messages_hidden': 0,
+            'hidden_group_refs': [],
             'reviewer_messages_deleted': 0,
             'database_deleted': False,
             'errors': []
@@ -537,15 +541,24 @@ class Design:
             group_msgs = DesignGroupMessage.get_by_code(code)
 
             for record in group_msgs:
-                deleted = await delete_messages(
+                # 'deleted' = fully removed; 'hidden' = older than 48h, so
+                # Telegram refuses bot deletion and we edited the message to
+                # a deletion marker instead (admins must remove the file).
+                outcome = await delete_group_message(
                     bot,
                     record['chat_id'],
-                    [record['message_id']]
+                    record['message_id']
                 )
-                result['group_messages_deleted'] += deleted
-                if not deleted:
+                if outcome == 'deleted':
+                    result['group_messages_deleted'] += 1
+                elif outcome == 'hidden':
+                    result['group_messages_hidden'] += 1
+                    result['hidden_group_refs'].append(
+                        f"chat={record['chat_id']} msg={record['message_id']}"
+                    )
+                else:
                     result['errors'].append(
-                        f"Group msg {record['message_id']}: delete failed"
+                        f"Group msg {record['message_id']} in chat {record['chat_id']}: delete failed"
                     )
 
             # --------------------------------------------------

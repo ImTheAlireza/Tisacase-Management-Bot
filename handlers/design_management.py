@@ -15,7 +15,7 @@ from models.design import Design
 from models.product_line import ProductLine
 from models.design_group_message import DesignGroupMessage
 from models.user import User
-from utils.helpers import safe_edit_message, delete_messages, format_datetime_persian
+from utils.helpers import safe_edit_message, delete_messages, format_datetime_persian, safe_answer_callback
 from utils.enums import DesignStatus
 from utils.callback_lock import deduplicate_callback
 
@@ -313,12 +313,12 @@ async def confirm_delete_callback(
     - Deduplication prevents race conditions.
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     # Fresh privilege check
     user: Optional[User] = User.get_by_id(query.from_user.id)
     if not user or not is_privileged(user.user_id):
-        await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+        await safe_answer_callback(query, "🚫 دسترسی غیرمجاز", show_alert=True)
         await safe_edit_message(query, "🚫 شما مجاز به حذف طرح نیستید.")
         return
 
@@ -382,6 +382,20 @@ async def confirm_delete_callback(
         f"🗑 پیام‌های حذف شده از گروه‌ها: {result['group_messages_deleted']}",
         f"🔓 کد {code} آزاد شد و قابل استفاده مجدد است.",
     ]
+
+    # Messages older than 48h: Telegram does not allow bots to delete them
+    # for everyone — we could only replace their captions with a marker.
+    if result.get('group_messages_hidden'):
+        result_lines.append(
+            f"\n⚠️ {result['group_messages_hidden']} پیام قدیمی‌تر از ۴۸ ساعت بود "
+            "و تلگرام اجازه حذف کامل آن را به ربات نمی‌دهد."
+        )
+        result_lines.append(
+            "کپشن آن‌ها به «🗑 حذف‌شده» تغییر کرد. برای پاک شدن کامل فایل، "
+            "ادمین باید دستی حذف کند:"
+        )
+        for ref in result.get('hidden_group_refs', [])[:5]:
+            result_lines.append(f"• {ref}")
 
     # Show non-fatal errors with details (e.g. messages already deleted)
     if result['errors']:
@@ -489,13 +503,13 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
     Print files are NOT sent to reviewers.
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     user_id: int = query.from_user.id
     user: Optional[User] = User.get_by_id(user_id)
 
     if not user or not user.is_active:
-        await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+        await safe_answer_callback(query, "🚫 دسترسی غیرمجاز", show_alert=True)
         return
 
     is_reviewer: bool = (
@@ -504,18 +518,18 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
         or User.is_privileged_user(user_id)
     )
     if not is_reviewer:
-        await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+        await safe_answer_callback(query, "🚫 دسترسی غیرمجاز", show_alert=True)
         return
 
     code: str = query.data.split('_', 2)[2]
     design: Optional[Design] = Design.get_by_code(code)
 
     if not design:
-        await query.answer("❌ این طرح یافت نشد یا حذف شده.", show_alert=True)
+        await safe_answer_callback(query, "❌ این طرح یافت نشد یا حذف شده.", show_alert=True)
         return
 
     if design.status != DesignStatus.PENDING:
-        await query.answer("⚠️ این طرح دیگر در انتظار نیست.", show_alert=True)
+        await safe_answer_callback(query, "⚠️ این طرح دیگر در انتظار نیست.", show_alert=True)
         return
 
     product_line: Optional[ProductLine] = ProductLine.get_by_id(design.product_line_id)
@@ -524,10 +538,8 @@ async def pending_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
     # Warn if too many files
     total_files: int = len(design.mockup_file_ids)
     if total_files > 10:
-        await query.answer(
-            f"⚠️ این طرح {total_files} فایل دارد. ارسال ممکن است کمی طول بکشد...",
-            show_alert=True
-        )
+        await safe_answer_callback(query, f"⚠️ این طرح {total_files} فایل دارد. ارسال ممکن است کمی طول بکشد...",
+            show_alert=True)
 
     # Send info header
     await context.bot.send_message(

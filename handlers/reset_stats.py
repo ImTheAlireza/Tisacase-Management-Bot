@@ -5,7 +5,7 @@ from telegram.ext import ContextTypes
 from models.user import User
 from models.product_line import ProductLine
 from services.activity_service import ActivityService
-from utils.helpers import format_datetime_persian
+from utils.helpers import format_datetime_persian, safe_answer_callback
 
 
 def _is_privileged(user_id: int) -> bool:
@@ -111,7 +111,7 @@ async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def reset_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle reset stats callbacks"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     user_id = query.from_user.id
     data = query.data
@@ -128,12 +128,12 @@ async def reset_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("reset_editor_"):
         target_id = int(data.split("_")[2])
         if not is_priv and user_id != target_id:
-            await query.answer("🚫 فقط می‌توانید آمار خودتان را بازنشانی کنید", show_alert=True)
+            await safe_answer_callback(query, "🚫 فقط می‌توانید آمار خودتان را بازنشانی کنید", show_alert=True)
             return
 
         target = User.get_by_id(target_id)
         if not target:
-            await query.answer("❌ کاربر یافت نشد", show_alert=True)
+            await safe_answer_callback(query, "❌ کاربر یافت نشد", show_alert=True)
             return
 
         # Show confirmation
@@ -156,12 +156,12 @@ async def reset_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif data.startswith("reset_reviewer_"):
         target_id = int(data.split("_")[2])
         if not is_priv and user_id != target_id:
-            await query.answer("🚫 فقط می‌توانید آمار خودتان را بازنشانی کنید", show_alert=True)
+            await safe_answer_callback(query, "🚫 فقط می‌توانید آمار خودتان را بازنشانی کنید", show_alert=True)
             return
 
         target = User.get_by_id(target_id)
         if not target:
-            await query.answer("❌ کاربر یافت نشد", show_alert=True)
+            await safe_answer_callback(query, "❌ کاربر یافت نشد", show_alert=True)
             return
 
         reset_info = ""
@@ -182,13 +182,13 @@ async def reset_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif data.startswith("reset_line_"):
         if not is_priv:
-            await query.answer("🚫 فقط Sudo و Nazi", show_alert=True)
+            await safe_answer_callback(query, "🚫 فقط Sudo و Nazi", show_alert=True)
             return
 
         line_id = int(data.split("_")[2])
         pl = ProductLine.get_by_id(line_id)
         if not pl:
-            await query.answer("❌ خط تولید یافت نشد", show_alert=True)
+            await safe_answer_callback(query, "❌ خط تولید یافت نشد", show_alert=True)
             return
 
         reset_info = ""

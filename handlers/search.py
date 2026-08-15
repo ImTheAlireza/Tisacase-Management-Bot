@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 from services.search_service import SearchService
 from models.product_line import ProductLine
 from models.user import User
-from utils.helpers import format_datetime_persian
+from utils.helpers import format_datetime_persian, safe_answer_callback
 from utils.enums import DesignStatus
 
 
@@ -132,7 +132,7 @@ async def _show_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def search_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle filter selection callbacks."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data = query.data
 
@@ -271,7 +271,7 @@ async def _show_line_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def search_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle back button."""
-    await update.callback_query.answer()
+    await safe_answer_callback(update.callback_query)
     await _show_filter_menu(update, context)
 
 
@@ -426,7 +426,7 @@ async def _show_design_details(update: Update, context: ContextTypes.DEFAULT_TYP
 
     design = Design.get_by_code(code)
     if not design:
-        await update.callback_query.answer("❌ طرح یافت نشد", show_alert=True)
+        await safe_answer_callback(update.callback_query, "❌ طرح یافت نشد", show_alert=True)
         return
 
     from models.product_line import ProductLine
