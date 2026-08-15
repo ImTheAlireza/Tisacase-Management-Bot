@@ -405,7 +405,7 @@ async def confirm_delete_callback(
                     f'• <a href="{link}">{message_id}</a>'
                 )
             else:
-                result_lines.append(f"• chat={chat_id} msg={message_id}")
+                result_lines.append(f"• پیام {message_id} (چت {chat_id})")
         if len(hidden_refs) > 10:
             result_lines.append(f"… و {len(hidden_refs) - 10} پیام دیگر")
 

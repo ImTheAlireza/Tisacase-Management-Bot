@@ -527,7 +527,7 @@ class Design:
 
         design = Design.get_by_code(code)
         if not design:
-            result['errors'].append(f"Design {code} not found")
+            result['errors'].append(f"طرح {code} یافت نشد")
             logging.warning(f"delete_completely: design {code} not found")
             return result
 
@@ -558,7 +558,7 @@ class Design:
                     )
                 else:
                     result['errors'].append(
-                        f"Group msg {record['message_id']} in chat {record['chat_id']}: delete failed"
+                        f"پیام {record['message_id']} در چت {record['chat_id']}: حذف ناموفق بود"
                     )
 
             # --------------------------------------------------
@@ -573,7 +573,7 @@ class Design:
                     f"✅ Deleted {len(group_msgs)} group message records for {code}"
                 )
             except Exception as e:
-                result['errors'].append(f"Failed to delete group records: {e}")
+                result['errors'].append(f"حذف رکوردهای گروه ناموفق بود: {e}")
                 logging.error(f"Could not delete group message records for {code}: {e}")
 
         # --------------------------------------------------
@@ -590,7 +590,7 @@ class Design:
                 failed = len(msg_ids) - deleted
                 if failed:
                     result['errors'].append(
-                        f"Reviewer {reviewer_id}: {failed}/{len(msg_ids)} message deletes failed"
+                        f"ناظر {reviewer_id}: حذف {failed} از {len(msg_ids)} پیام ناموفق بود"
                     )
 
         # --------------------------------------------------
@@ -612,7 +612,7 @@ class Design:
                 cursor.close()
                 conn.close()
         except Exception as e:
-            result['errors'].append(f"Failed to free locked code: {e}")
+            result['errors'].append(f"آزادسازی کد قفل‌شده ناموفق بود: {e}")
             logging.error(f"Could not free locked code {code}: {e}")
 
         # --------------------------------------------------
@@ -629,7 +629,7 @@ class Design:
                 f"Reviewer msgs: {result['reviewer_messages_deleted']}"
             )
         except Exception as e:
-            result['errors'].append(f"Database deletion failed: {e}")
+            result['errors'].append(f"حذف از دیتابیس ناموفق بود: {e}")
             logging.error(f"Database deletion failed for {code}: {e}")
 
         return result
