@@ -2,6 +2,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from utils.decorators import require_sudo
 from utils.enums import DesignStatus
+from utils.helpers import safe_answer_callback
 
 # ---------------------------------------------------------------------------
 # Help content — each category as a dict with text and optional back button
@@ -199,12 +200,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle help category navigation"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     category_key = query.data.replace("help_", "")
 
     if category_key not in HELP_CATEGORIES:
-        await query.answer("❌ بخش یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ بخش یافت نشد", show_alert=True)
         return
 
     await query.edit_message_text(

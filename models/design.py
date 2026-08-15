@@ -504,18 +504,22 @@ class Design:
                 'code': str,
                 'status': str,
                 'group_messages_deleted': int,
+                'group_messages_hidden': int,
+                'hidden_group_refs': list[tuple[int, int, str]],
                 'reviewer_messages_deleted': int,
                 'database_deleted': bool,
                 'errors': list[str]
             }
         """
         from models.design_group_message import DesignGroupMessage
-        from utils.helpers import delete_messages
+        from utils.helpers import delete_messages, delete_group_message, group_file_label
 
         result = {
             'code': code,
             'status': 'not_found',
             'group_messages_deleted': 0,
+            'group_messages_hidden': 0,
+            'hidden_group_refs': [],
             'reviewer_messages_deleted': 0,
             'database_deleted': False,
             'errors': []
@@ -523,7 +527,7 @@ class Design:
 
         design = Design.get_by_code(code)
         if not design:
-            result['errors'].append(f"Design {code} not found")
+            result['errors'].append(f"طرح {code} یافت نشد")
             logging.warning(f"delete_completely: design {code} not found")
             return result
 
@@ -535,17 +539,37 @@ class Design:
         # --------------------------------------------------
         if design.status == DesignStatus.APPROVED:
             group_msgs = DesignGroupMessage.get_by_code(code)
+            # Print files are named "{code}" (single) or "{code}_{i+1}"
+            # (multiple) when sent to the print group; used for link labels.
+            print_count = sum(
+                1 for r in group_msgs if r['group_type'] == 'print'
+            )
 
             for record in group_msgs:
-                deleted = await delete_messages(
+                # 'deleted' = fully removed; 'hidden' = older than 48h, so
+                # Telegram refuses bot deletion and we edited the message to
+                # a deletion marker instead (admins must remove the file).
+                outcome = await delete_group_message(
                     bot,
                     record['chat_id'],
-                    [record['message_id']]
+                    record['message_id']
                 )
-                result['group_messages_deleted'] += deleted
-                if not deleted:
+                if outcome == 'deleted':
+                    result['group_messages_deleted'] += 1
+                elif outcome == 'hidden':
+                    result['group_messages_hidden'] += 1
+                    label = group_file_label(
+                        code,
+                        record['group_type'],
+                        record['file_index'],
+                        print_count
+                    )
+                    result['hidden_group_refs'].append(
+                        (record['chat_id'], record['message_id'], label)
+                    )
+                else:
                     result['errors'].append(
-                        f"Group msg {record['message_id']}: delete failed"
+                        f"پیام {record['message_id']} در چت {record['chat_id']}: حذف ناموفق بود"
                     )
 
             # --------------------------------------------------
@@ -560,7 +584,7 @@ class Design:
                     f"✅ Deleted {len(group_msgs)} group message records for {code}"
                 )
             except Exception as e:
-                result['errors'].append(f"Failed to delete group records: {e}")
+                result['errors'].append(f"حذف رکوردهای گروه ناموفق بود: {e}")
                 logging.error(f"Could not delete group message records for {code}: {e}")
 
         # --------------------------------------------------
@@ -577,7 +601,7 @@ class Design:
                 failed = len(msg_ids) - deleted
                 if failed:
                     result['errors'].append(
-                        f"Reviewer {reviewer_id}: {failed}/{len(msg_ids)} message deletes failed"
+                        f"ناظر {reviewer_id}: حذف {failed} از {len(msg_ids)} پیام ناموفق بود"
                     )
 
         # --------------------------------------------------
@@ -599,7 +623,7 @@ class Design:
                 cursor.close()
                 conn.close()
         except Exception as e:
-            result['errors'].append(f"Failed to free locked code: {e}")
+            result['errors'].append(f"آزادسازی کد قفل‌شده ناموفق بود: {e}")
             logging.error(f"Could not free locked code {code}: {e}")
 
         # --------------------------------------------------
@@ -616,7 +640,7 @@ class Design:
                 f"Reviewer msgs: {result['reviewer_messages_deleted']}"
             )
         except Exception as e:
-            result['errors'].append(f"Database deletion failed: {e}")
+            result['errors'].append(f"حذف از دیتابیس ناموفق بود: {e}")
             logging.error(f"Database deletion failed for {code}: {e}")
 
         return result

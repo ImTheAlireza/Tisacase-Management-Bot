@@ -74,7 +74,7 @@ class CleanupService:
                     else:
                         errors.extend(result['errors'])
                 except Exception as e:
-                    errors.append(f"Failed to delete {design.code}: {e}")
+                    errors.append(f"حذف طرح {design.code} ناموفق بود: {e}")
                     logging.error(f"Cleanup failed for {design.code}: {e}")
 
         return {

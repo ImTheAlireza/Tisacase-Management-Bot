@@ -1,3 +1,4 @@
+import asyncio
 import html
 from telegram import Update, InputFile
 from telegram.ext import ContextTypes
@@ -6,7 +7,7 @@ from models.design import Design
 from models.design_group_message import DesignGroupMessage
 from models.user import User
 from models.product_line import ProductLine
-from utils.helpers import safe_edit_message, delete_messages, send_with_retry
+from utils.helpers import safe_edit_message, delete_messages, send_with_retry, safe_answer_callback
 from config.settings import SUDO_USER_ID, MAX_FILE_SIZE_DOWNLOAD_MB, LOG_GROUP_ID
 import logging
 from io import BytesIO
@@ -34,8 +35,8 @@ async def _send_media_with_retry(send, label: str, max_retries: int = 3):
     return await send_with_retry(send, label, max_retries=max_retries)
 
 
-async def _log_to_group(context, text: str) -> None:
-    """Send a log message to the LOG_GROUP_ID channel (sudo-only)."""
+async def _send_log_to_group(context, text: str) -> None:
+    """Deliver one log message to LOG_GROUP_ID (best-effort)."""
     try:
         await send_with_retry(
             lambda: context.bot.send_message(
@@ -47,6 +48,24 @@ async def _log_to_group(context, text: str) -> None:
         )
     except Exception as e:
         logging.error(f"{LOG_TAG} Failed to send log to LOG_GROUP_ID: {e}")
+
+
+def _log_to_group(context, text: str) -> None:
+    """Queue a log message for LOG_GROUP_ID without stalling the handler.
+
+    Telegram flood control on the log chat can force multi-second waits (with
+    retries, up to ~90s). Awaiting that inside review_callback would hold the
+    review lock and delay the user-visible completion of the approve/reject,
+    so delivery runs as a background task instead. Logs are best-effort and
+    must never block (or crash) the review flow.
+    """
+    try:
+        asyncio.get_running_loop().create_task(
+            _send_log_to_group(context, text)
+        )
+    except RuntimeError:
+        # No running event loop (unusual in a handler); just drop the log.
+        logging.error(f"{LOG_TAG} No event loop — log not sent: {text[:120]}")
 
 
 def _review_key(update, context) -> str:
@@ -304,7 +323,7 @@ async def _finalize_rejection_with_reason(
         escaped_name = html.escape(user.first_name or str(user.user_id))
         safe_reason = _truncate_rejection_reason(reason)
         escaped_reason = html.escape(safe_reason)
-        await _log_to_group(
+        _log_to_group(
             context,
             f"❌ <b>REJECT {escaped_code}</b> by {escaped_name}\n"
             f"📝 <b>Reason:</b>\n<pre>{escaped_reason}</pre>"
@@ -406,7 +425,11 @@ async def handle_reject_reason_reply(
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     query = update.callback_query
-    await query.answer()
+    # Answer first, but never let a stale/duplicate query kill the review.
+    # Telegram invalidates the query after a short window (delayed processing,
+    # double-taps), and losing the cosmetic answer must not lose the actual
+    # approve/reject work that follows.
+    await safe_answer_callback(query)
 
     user = User.get_by_id(query.from_user.id)
     action, code = query.data.split('_', 1)
@@ -420,13 +443,13 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # -------------------------------------------------
     if not design:
         logging.warning(f"{LOG_TAG} Design {code} not found")
-        await _log_to_group(context, f"❌ <b>{code}</b> NOT FOUND")
+        _log_to_group(context, f"❌ <b>{code}</b> NOT FOUND")
         await safe_edit_message(query, f"❌ طرح با کد {code} در سیستم یافت نشد.")
         return
 
     if design.id is None:
         logging.error(f"{LOG_TAG} Design {code} has id=None")
-        await _log_to_group(context, f"❌ <b>{code}</b> id=None — CRITICAL")
+        _log_to_group(context, f"❌ <b>{code}</b> id=None — CRITICAL")
         await safe_edit_message(query, "❌ خطای داخلی: طرح بدون شناسه (ID) است.")
         return
 
@@ -466,7 +489,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not won:
             fresh = Design.get_by_code(code)
             other = fresh.reviewer_name if fresh else "ناظر دیگر"
-            await _log_to_group(context, f"⚠️ Approve LOST: <b>{code}</b> → {other}")
+            _log_to_group(context, f"⚠️ Approve LOST: <b>{code}</b> → {other}")
             await safe_edit_message(query, f"⚠️ این طرح همین الان توسط {other} پردازش شد.\nشما کمی دیر رسیدید.")
             return
 
@@ -651,7 +674,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             for fid, detail in failures:
                 log_lines.append(f"• {fid[:20]}... — <pre>{detail[:100]}</pre>")
 
-        await _log_to_group(context, "\n".join(log_lines))
+        _log_to_group(context, "\n".join(log_lines))
         logging.info(f"{LOG_TAG} DONE | {code} | ok={total_ok}/{total_expected} fail={total_fail}")
 
     await _send_decision_notifications(

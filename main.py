@@ -16,7 +16,7 @@ from telegram.ext import (
 
 # Configuration & Infrastructure
 from config.settings import BOT_TOKEN, BACKUP_TIME_HOUR, BACKUP_TIME_MINUTE, LOG_LEVEL, LOG_FORMAT, LOG_GROUP_ID, SERVER_BILL_REMINDER_HOUR, SERVER_BILL_REMINDER_MINUTE
-from utils.helpers import get_tehran_time, TEHRAN_TZ
+from utils.helpers import get_tehran_time, TEHRAN_TZ, safe_answer_callback
 from config.database import test_connection, init_legacy_tables
 from services.backup_service import BackupService, send_daily_backup
 from services.code_service import CodeService
@@ -115,7 +115,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         user_msg = "❌ خطای داخلی رخ داد. تیم فنی در جریان قرار گرفت."
         try:
             if update.callback_query:
-                await update.callback_query.answer(user_msg, show_alert=True)
+                await safe_answer_callback(update.callback_query, user_msg, show_alert=True)
             elif update.message:
                 await update.message.reply_text(user_msg)
         except Exception:
@@ -307,17 +307,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward the daily log message to a reviewer when sudo taps the button"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     from config.settings import SUDO_USER_ID
     if query.from_user.id != SUDO_USER_ID:
-        await query.answer("🚫 فقط Sudo", show_alert=True)
+        await safe_answer_callback(query, "🚫 فقط Sudo", show_alert=True)
         return
 
     target_user_id = int(query.data.split('_')[1])
     target_user = User.get_by_id(target_user_id)
     if not target_user:
-        await query.answer("❌ کاربر یافت نشد", show_alert=True)
+        await safe_answer_callback(query, "❌ کاربر یافت نشد", show_alert=True)
         return
 
     try:
@@ -326,10 +326,10 @@ async def sendlog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_chat_id=query.message.chat_id,
             message_id=query.message.message_id
         )
-        await query.answer(f"✅ ارسال شد به {target_user.first_name}")
+        await safe_answer_callback(query, f"✅ ارسال شد به {target_user.first_name}")
     except Exception as e:
         logging.error(f"Failed to forward log to {target_user_id}: {e}")
-        await query.answer("❌ ارسال ناموفق", show_alert=True)
+        await safe_answer_callback(query, "❌ ارسال ناموفق", show_alert=True)
 
 
 async def send_startup_notification(context: ContextTypes.DEFAULT_TYPE):
@@ -365,6 +365,14 @@ class TelegramLogHandler(logging.Handler):
     the log group.
     """
     MAX_QUEUE_SIZE = 200
+    # Telegram allows ~20 bot messages per minute per group chat. The old
+    # drain sent one message per record at 0.3s pacing (up to 200 msg/min),
+    # so every burst of logs 429'd the log chat itself and forced multi-second
+    # flood-control waits in the handlers. Batch records into one message and
+    # pace sends to stay under the chat limit.
+    BATCH_MAX_LINES = 15
+    BATCH_MAX_CHARS = 2500
+    SEND_INTERVAL = 3.5
 
     def __init__(self, bot, chat_id):
         super().__init__()
@@ -402,17 +410,31 @@ class TelegramLogHandler(logging.Handler):
 
     async def _process_queue(self):
         while self.message_queue:
-            msg = self.message_queue.pop(0)
-            safe_msg = html.escape(msg[:3000])
+            # Collect one batch: as many queued records as fit in a message.
+            batch = []
+            chars = 0
+            while self.message_queue and len(batch) < self.BATCH_MAX_LINES:
+                msg = self.message_queue[0]
+                if batch and chars + len(msg) > self.BATCH_MAX_CHARS:
+                    break
+                self.message_queue.pop(0)
+                batch.append(msg)
+                chars += len(msg)
+
+            if not batch:
+                continue
+
+            safe_msg = html.escape("\n".join(batch)[:3000])
             try:
                 await self.bot.send_message(
                     self.chat_id,
                     f"ℹ️ Bot Log\n<pre>{safe_msg}</pre>",
                     parse_mode="HTML"
                 )
-                await asyncio.sleep(0.3)
             except RetryAfter as e:
-                # Respect Telegram flood control on the log chat itself.
+                # Respect Telegram flood control on the log chat itself: put
+                # the batch back (do NOT drop it) and wait out the window.
+                self.message_queue[0:0] = batch
                 raw = getattr(e, 'retry_after', 1)
                 if hasattr(raw, 'total_seconds'):  # datetime.timedelta (PTB >= 22)
                     try:
@@ -427,8 +449,11 @@ class TelegramLogHandler(logging.Handler):
                 await asyncio.sleep(wait)
             except Exception:
                 # Never let log delivery crash the bot; drop this single
-                # message and keep draining the rest of the queue.
+                # batch and keep draining the rest of the queue.
                 pass
+            # Pace the next send so the bot stays under the chat's limit
+            # instead of triggering another 429.
+            await asyncio.sleep(self.SEND_INTERVAL)
 
 
 if __name__ == "__main__":

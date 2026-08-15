@@ -2,6 +2,7 @@ import asyncio
 import logging
 from typing import Callable
 from functools import wraps
+from utils.helpers import safe_answer_callback
 
 
 class CallbackLock:
@@ -71,10 +72,8 @@ def deduplicate_callback(key_func: Callable) -> Callable:
             if not acquired:
                 logging.warning(f"Duplicate callback blocked for key: {key}")
                 try:
-                    await query.answer(
-                        "⏳ این درخواست در حال پردازش است. لطفاً صبر کنید...",
-                        show_alert=False
-                    )
+                    await safe_answer_callback(query, "⏳ این درخواست در حال پردازش است. لطفاً صبر کنید...",
+                        show_alert=False)
                 except Exception:
                     pass
                 return

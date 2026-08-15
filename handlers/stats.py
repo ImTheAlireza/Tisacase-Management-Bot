@@ -6,6 +6,7 @@ from services.stats_service import StatsService
 from models.design import Design
 from models.user import User
 from utils.enums import DesignStatus
+from utils.helpers import safe_answer_callback
 
 
 def is_privileged(user_id):
@@ -69,10 +70,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     if not is_privileged(query.from_user.id):
-        await query.answer("🚫 دسترسی غیرمجاز", show_alert=True)
+        await safe_answer_callback(query, "🚫 دسترسی غیرمجاز", show_alert=True)
         return
 
     action = query.data

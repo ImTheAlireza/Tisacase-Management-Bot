@@ -9,7 +9,7 @@ from utils.decorators import require_sudo
 from models.user import User
 from models.product_line import ProductLine
 from services.backup_service import BackupService
-from utils.helpers import get_tehran_time, send_with_retry
+from utils.helpers import get_tehran_time, send_with_retry, safe_answer_callback
 from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS
 from utils.enums import DesignStatus
 from utils.callback_lock import deduplicate_callback
@@ -51,10 +51,10 @@ async def handle_role_switch(update: Update, context: ContextTypes.DEFAULT_TYPE)
     new_role = query.data.split('_')[1]
 
     if new_role not in ALLOWED_ROLES:
-        await query.answer("❌ نقش نامعتبر", show_alert=True)
+        await safe_answer_callback(query, "❌ نقش نامعتبر", show_alert=True)
         return
 
-    await query.answer()
+    await safe_answer_callback(query)
 
     user = User.get_by_id(query.from_user.id)
     user.update_active_role(new_role)
@@ -106,7 +106,7 @@ async def manual_backup_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def backup_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle backup type selection callbacks"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     if query.data == "backup_csv":
         keyboard = [
@@ -149,7 +149,7 @@ async def backup_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def csv_range_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle CSV time range selection"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     if query.data == "csv_cancel":
         await query.edit_message_text("❌ عملیات لغو شد.")
@@ -216,11 +216,11 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def confirm_restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle restore confirmation buttons"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     # Only sudo can confirm
     if query.from_user.id != SUDO_USER_ID:
-        await query.answer("🚫 فقط Sudo", show_alert=True)
+        await safe_answer_callback(query, "🚫 فقط Sudo", show_alert=True)
         return
 
     if query.data == "cancel_restore":
@@ -299,7 +299,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @require_sudo
 async def execute_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     if query.data == "cancel_restart":
         await query.edit_message_text("لغو شد.")
@@ -364,7 +364,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 @require_sudo
 async def broadcast_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     users = User.get_all_active()
     sent_count = 0
@@ -429,7 +429,7 @@ async def group_management_command(update: Update, context: ContextTypes.DEFAULT
 @require_sudo
 async def group_management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     data = query.data
 
     if data.startswith("setgroup_select_"):
@@ -616,7 +616,7 @@ def _kill_key(update, context) -> str:
 async def confirm_delete_design_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle design deletion confirmation"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data = query.data
 

@@ -119,6 +119,135 @@ async def send_with_retry(
     raise RuntimeError(f"{label} failed unexpectedly")
 
 
+async def safe_answer_callback(
+    query,
+    text: Optional[str] = None,
+    show_alert: bool = False,
+) -> bool:
+    """Answer a callback query and never raise.
+
+    Telegram invalidates a callback query after a short window and after it
+    has been answered once; answering a stale/duplicate query raises
+    ``BadRequest: Query is too old and response timeout expired or query id
+    is invalid``. The answer is purely cosmetic (stops the client spinner),
+    so a failed answer must never abort the handler's actual work.
+
+    Returns True when the answer was delivered, False otherwise.
+    """
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+        return True
+    except Exception as e:
+        logging.warning(f"Could not answer callback query: {e}")
+        return False
+
+
+DELETED_BY_BOT_CAPTION = "🗑❌ این فایل توسط ربات حذف شد. لطفا از این فایل استفاده نشود"
+DELETED_BY_BOT_TEXT = "🗑❌ این پیام توسط ربات حذف شد."
+
+
+def group_message_link(chat_id: int, message_id: int) -> str | None:
+    """Build a t.me link to a group message (None for private chats).
+
+    Works for basic groups (id like -4608593336) and supergroups
+    (id like -1001234567890): the link is t.me/c/<id>/<message_id>,
+    with the supergroup '100' prefix stripped.
+    """
+    if chat_id >= 0:
+        return None
+    cid = abs(chat_id)
+    cid_str = str(cid)
+    if cid_str.startswith('100') and len(cid_str) >= 10:
+        cid = int(cid_str[3:])
+    return f"https://t.me/c/{cid}/{message_id}"
+
+
+def group_file_label(code: str, group_type: str, file_index: int, print_count: int) -> str:
+    """Human-readable label for a group message in deletion reports.
+
+    Print files are named "{code}" (single) or "{code}_{i+1}" (multiple)
+    when sent to the print group; mockups are labeled by their position.
+    """
+    if group_type == 'print':
+        if print_count == 1:
+            return code
+        return f"{code}_{file_index + 1}"
+    return f"{code}_موکاپ {file_index + 1}"
+
+
+async def _mark_message_deleted(bot, chat_id: int, message_id: int) -> bool:
+    """Edit a message to a deletion marker (best-effort).
+
+    Bots can edit their own messages regardless of age, so when a full
+    delete is impossible this at least hides the caption and signals the
+    message is obsolete. Returns True when any edit succeeded.
+    """
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=DELETED_BY_BOT_CAPTION,
+            reply_markup=None
+        )
+        return True
+    except Exception:
+        pass
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=DELETED_BY_BOT_TEXT,
+            reply_markup=None
+        )
+        return True
+    except Exception as e:
+        logging.warning(
+            f"Could not edit message {message_id} in chat {chat_id}: {e}"
+        )
+        return False
+
+
+async def delete_group_message(bot, chat_id: int, message_id: int) -> str:
+    """Delete one group message for everyone, with a fallback for old messages.
+
+    Telegram hard-limits bot deletions to messages sent less than 48 hours
+    ago; older messages raise ``BadRequest: message can't be deleted for
+    everyone`` and NO bot-side API call can fully remove them (this limit
+    applies even in supergroups). Editing has no age limit, so as a fallback
+    we edit the message to a deletion marker to hide its caption and flag it
+    for manual removal by a human admin.
+
+    Returns one of:
+        'deleted' — message fully deleted for everyone.
+        'hidden'  — too old to delete; caption/content replaced with a
+                    deletion marker (human admin can still remove the file).
+        'failed'  — deletion failed for another reason (no rights, 429
+                    exhausted, ...) and the marker edit also failed.
+    """
+    try:
+        await send_with_retry(
+            lambda: bot.delete_message(chat_id=chat_id, message_id=message_id),
+            f"Delete message {message_id} in chat {chat_id}"
+        )
+        return 'deleted'
+    except Exception as e:
+        error_text = str(e).lower()
+        if "can't be deleted" not in error_text:
+            logging.warning(
+                f"Delete message {message_id} in chat {chat_id} failed: {e}"
+            )
+            return 'failed'
+
+        logging.info(
+            f"Message {message_id} in chat {chat_id} is older than 48h — "
+            "Telegram refuses bot deletion; editing to a deletion marker"
+        )
+        if await _mark_message_deleted(bot, chat_id, message_id):
+            return 'hidden'
+        return 'failed'
+
+
 async def delete_messages(bot, chat_id: int, message_ids: list[int]) -> int:
     """Safely delete multiple messages with pacing and 429 retry.
 
