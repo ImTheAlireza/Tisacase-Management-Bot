@@ -2,5 +2,3 @@
 __pycache__/
 *.pyc
 .env
-userbot/*.session
-userbot/*.session-journal

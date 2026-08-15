@@ -506,14 +506,12 @@ class Design:
                 'group_messages_deleted': int,
                 'group_messages_hidden': int,
                 'hidden_group_refs': list[str],
-                'userbot_queued': int,
                 'reviewer_messages_deleted': int,
                 'database_deleted': bool,
                 'errors': list[str]
             }
         """
         from models.design_group_message import DesignGroupMessage
-        from models.userbot_deletion_queue import UserbotDeletionQueue
         from utils.helpers import delete_messages, delete_group_message
 
         result = {
@@ -522,7 +520,6 @@ class Design:
             'group_messages_deleted': 0,
             'group_messages_hidden': 0,
             'hidden_group_refs': [],
-            'userbot_queued': 0,
             'reviewer_messages_deleted': 0,
             'database_deleted': False,
             'errors': []
@@ -559,14 +556,6 @@ class Design:
                     result['hidden_group_refs'].append(
                         f"chat={record['chat_id']} msg={record['message_id']}"
                     )
-                    # The 48h bot limit blocked us — hand it to the userbot
-                    # worker (user accounts can delete old messages).
-                    if UserbotDeletionQueue.enqueue(
-                        record['chat_id'],
-                        record['message_id'],
-                        code
-                    ):
-                        result['userbot_queued'] += 1
                 else:
                     result['errors'].append(
                         f"Group msg {record['message_id']} in chat {record['chat_id']}: delete failed"

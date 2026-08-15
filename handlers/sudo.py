@@ -681,36 +681,3 @@ async def cleanup_orphans_command(update: Update, context: ContextTypes.DEFAULT_
         msg += f"\n\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in result['errors'][:5])
 
     await update.message.reply_text(msg)
-
-
-
-@require_sudo
-async def userbot_queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """\u200f/userbotqueue — status of the userbot deletion queue."""
-    from models.userbot_deletion_queue import UserbotDeletionQueue
-
-    counts = UserbotDeletionQueue.counts()
-    failed = UserbotDeletionQueue.recent_failed(limit=5)
-
-    lines = [
-        "🤖 وضعیت صف حذف یوزربات",
-        "━━━━━━━━━━━━━━━━━━",
-        f"⏳ در انتظار: {counts['pending']}",
-        f"⚙️ در حال پردازش: {counts['processing']}",
-        f"✅ انجام شده: {counts['done']}",
-        f"❌ ناموفق: {counts['failed']}",
-    ]
-
-    if failed:
-        lines.append("\n❌ آخرین خطاها:")
-        for row in failed:
-            code = row.get('code') or '-'
-            lines.append(
-                f"• {code} | chat={row['chat_id']} msg={row['message_id']} "
-                f"(attempt {row['attempts']}): {row.get('last_error') or '?'}"
-            )
-
-    if counts['pending'] or counts['processing']:
-        lines.append("\n🔄 یوزربات به‌صورت خودکار این پیام‌ها را حذف می‌کند.")
-
-    await update.message.reply_text("\n".join(lines))
