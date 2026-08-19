@@ -16,6 +16,23 @@ PUBLIC_DIR = '/home/selfnit4/self/public'
 class RestoreService:
 
     @staticmethod
+    def is_safe_relative_path(relative: str) -> bool:
+        """Return True if `relative` stays inside its base directory when joined.
+
+        Guards against zip-slip: rejects absolute paths, backslash separators
+        (Windows-style traversal), and any `..` path component.
+        """
+        if not relative:
+            return False
+        if os.path.isabs(relative):
+            return False
+        if '\\' in relative:
+            return False
+        if '..' in relative.split('/'):
+            return False
+        return True
+
+    @staticmethod
     def find_sql_in_zip(zip_path: str) -> str | None:
         """Find the .sql file inside the backup ZIP"""
         with zipfile.ZipFile(zip_path, 'r') as z:
@@ -129,12 +146,27 @@ class RestoreService:
                     relative = entry[len('public/'):]
                     if not relative:
                         continue
+
+                    # Zip-slip guard: reject paths that would escape PUBLIC_DIR.
+                    if not RestoreService.is_safe_relative_path(relative):
+                        logging.warning(f"Skipping unsafe path in backup: {entry!r}")
+                        continue
+
                     target = os.path.join(PUBLIC_DIR, relative)
+
+                    # Defense-in-depth: never write outside PUBLIC_DIR even if
+                    # the validation above missed an edge case.
+                    target_abs = os.path.abspath(target)
+                    base_abs = os.path.abspath(PUBLIC_DIR)
+                    if not (target_abs == base_abs or target_abs.startswith(base_abs + os.sep)):
+                        logging.warning(f"Skipping path outside public dir: {entry!r}")
+                        continue
+
                     os.makedirs(os.path.dirname(target), exist_ok=True)
 
                     if not entry.endswith('/'):
                         with z.open(entry) as src, open(target, 'wb') as dst:
-                            dst.write(src.read())
+                            shutil.copyfileobj(src, dst)
                         restored += 1
 
                 return {

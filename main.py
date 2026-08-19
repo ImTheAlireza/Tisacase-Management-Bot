@@ -8,14 +8,14 @@ import traceback
 
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, NetworkError, TimedOut
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     CallbackQueryHandler, ContextTypes
 )
 
 # Configuration & Infrastructure
-from config.settings import BOT_TOKEN, BACKUP_TIME_HOUR, BACKUP_TIME_MINUTE, LOG_LEVEL, LOG_FORMAT, LOG_GROUP_ID, SERVER_BILL_REMINDER_HOUR, SERVER_BILL_REMINDER_MINUTE
+from config.settings import BOT_TOKEN, BACKUP_TIME_HOUR, BACKUP_TIME_MINUTE, LOG_LEVEL, LOG_FORMAT, LOG_GROUP_ID, SERVER_BILL_REMINDER_HOUR, SERVER_BILL_REMINDER_MINUTE, TELEGRAM_LOG_LEVEL
 from utils.helpers import get_tehran_time, TEHRAN_TZ, safe_answer_callback
 from config.database import test_connection, init_legacy_tables
 from services.backup_service import BackupService, send_daily_backup
@@ -85,7 +85,19 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     Global handler for uncaught exceptions in any handler.
     Logs to console, sends sanitized version to LOG_GROUP_ID, and notifies user if possible.
     """
-    logging.error("Uncaught exception:", exc_info=context.error)
+    error = context.error
+
+    # Transient network errors during polling (e.g. `httpx.ReadError` / `NetworkError`
+    # while `get_updates` long-polling) are NOT bugs: python-telegram-bot's updater
+    # catches them and retries automatically with backoff, so the bot keeps running.
+    # Forwarding a full "Uncaught Exception" traceback for these only spams the log
+    # group with noise. Log them quietly at DEBUG level (won't be forwarded to
+    # Telegram, since the TelegramLogHandler only forwards INFO+) and skip the rest.
+    if error is not None and isinstance(error, (NetworkError, TimedOut)) and update is None:
+        logging.debug("Transient network error while getting updates (self-recovering): %r", error)
+        return
+
+    logging.error("Uncaught exception:", exc_info=error)
     tb_str = ''.join(traceback.format_exception(
         type(context.error), context.error, context.error.__traceback__
     ))
@@ -466,7 +478,9 @@ if __name__ == "__main__":
     application.add_error_handler(global_error_handler)
 
     telegram_handler = TelegramLogHandler(application.bot, LOG_GROUP_ID)
-    telegram_handler.setLevel(logging.INFO)
+    # Forward only records at/above TELEGRAM_LOG_LEVEL (default INFO) to the
+    # log group; anything lower still goes to the console via the root handler.
+    telegram_handler.setLevel(getattr(logging, TELEGRAM_LOG_LEVEL, logging.INFO))
     logging.getLogger().addHandler(telegram_handler)
 
     # -----------------------------------------------------------------------

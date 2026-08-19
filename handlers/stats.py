@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -86,30 +87,30 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif action == "stats_lines":
         await query.edit_message_text("⏳ در حال بارگذاری...")
-        text = _build_lines_text()
+        text = await _build_lines_text()
         await query.edit_message_text(text, reply_markup=_back_markup())
 
     elif action == "stats_users":
         await query.edit_message_text("⏳ در حال بارگذاری...")
-        text = _build_users_text()
+        text = await _build_users_text()
         await query.edit_message_text(text, reply_markup=_back_markup())
 
     elif action == "stats_top":
         await query.edit_message_text("⏳ در حال بارگذاری...")
-        text = _build_top_text()
+        text = await _build_top_text()
         await query.edit_message_text(text, reply_markup=_back_markup())
 
     elif action == "stats_system":
         await query.edit_message_text("⏳ در حال بارگذاری...")
-        text = _build_system_text()
+        text = await _build_system_text()
         await query.edit_message_text(text, reply_markup=_back_markup())
 
 
 
 
-def _build_lines_text() -> str:
+async def _build_lines_text() -> str:
     try:
-        rows = StatsService.get_product_line_stats()
+        rows = await asyncio.to_thread(StatsService.get_product_line_stats)
     except Exception as e:
         logging.error(f"Stats lines error: {e}")
         return "❌ خطا در بارگذاری آمار خطوط تولید."
@@ -144,10 +145,10 @@ def _build_lines_text() -> str:
     return '\n'.join(lines)
 
 
-def _build_users_text() -> str:
+async def _build_users_text() -> str:
     try:
-        editors = StatsService.get_editor_stats()
-        reviewers = StatsService.get_reviewer_stats()
+        editors = await asyncio.to_thread(StatsService.get_editor_stats)
+        reviewers = await asyncio.to_thread(StatsService.get_reviewer_stats)
     except Exception as e:
         logging.error(f"Stats users error: {e}")
         return "❌ خطا در بارگذاری آمار کاربران."
@@ -197,9 +198,9 @@ def _build_users_text() -> str:
     return '\n'.join(lines)
 
 
-def _build_top_text() -> str:
+async def _build_top_text() -> str:
     try:
-        top = StatsService.get_top_performers()
+        top = await asyncio.to_thread(StatsService.get_top_performers)
     except Exception as e:
         logging.error(f"Stats top error: {e}")
         return "❌ خطا در بارگذاری برترین‌ها."
@@ -235,9 +236,9 @@ def _build_top_text() -> str:
     return '\n'.join(lines)
 
 
-def _build_system_text() -> str:
+async def _build_system_text() -> str:
     try:
-        data = StatsService.get_system_stats()
+        data = await asyncio.to_thread(StatsService.get_system_stats)
     except Exception as e:
         logging.error(f"Stats system error: {e}")
         return "❌ خطا در بارگذاری اطلاعات سیستم."

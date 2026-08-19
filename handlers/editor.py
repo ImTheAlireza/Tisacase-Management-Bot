@@ -1168,10 +1168,19 @@ async def _handle_restore_file(
             shutil.rmtree(temp_dir, ignore_errors=True)
             return
 
-        # Extract SQL file
+        # Zip-slip guard: reject a crafted SQL path before extracting.
+        if not RestoreService.is_safe_relative_path(sql_name):
+            logging.warning(f"Rejected unsafe SQL path in backup: {sql_name!r}")
+            await status_msg.edit_text("❌ فایل SQL نامعتبر است (مسیر ناامن).")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        # Extract SQL file. Write directly to a sanitized path — never rely on
+        # zipfile.extract(), which is vulnerable to zip-slip path traversal.
         sql_path = os.path.join(temp_dir, sql_name)
         with zipfile.ZipFile(zip_path, 'r') as z:
-            z.extract(sql_name, temp_dir)
+            with z.open(sql_name) as src, open(sql_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
 
         # Confirm with user
         context.user_data['restore_pending'] = {
