@@ -10,8 +10,9 @@ import logging
 import asyncio
 from datetime import datetime
 from config.database import get_db_connection
-from config.settings import DB_CONFIG
+from config.settings import DB_CONFIG, TELEGRAM_UPLOAD_LIMIT_BYTES
 from utils.helpers import get_tehran_time
+from utils.enums import DesignStatus
 
 
 def _as_int(value) -> int:
@@ -470,14 +471,30 @@ async def send_daily_backup(context):
 
     if zip_path:
         try:
-            file_size = os.path.getsize(zip_path) / 1024
-            with open(zip_path, 'rb') as f:
-                await context.bot.send_document(
+            file_size = os.path.getsize(zip_path)
+            file_size_kb = file_size / 1024
+
+            if file_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+                # Telegram rejects documents over the upload limit, so a direct
+                # send_document would fail (413/BadRequest) without a clear
+                # notice. Warn sudo explicitly instead.
+                await context.bot.send_message(
                     chat_id=SUDO_USER_ID,
-                    document=f,
-                    filename=os.path.basename(zip_path),
-                    caption=f"💾 بکاپ روزانه (شامل Public)\nحجم: {file_size:.1f} KB"
+                    text=(
+                        f"⚠️ بکاپ روزانه ساخته شد اما قابل ارسال نیست.\n"
+                        f"حجم فایل ({file_size_kb / 1024:.1f} MB) از سقف تلگرام "
+                        f"({TELEGRAM_UPLOAD_LIMIT_BYTES // (1024 * 1024)} MB) بیشتر است.\n"
+                        f"برای کاهش حجم، پوشه public را سبک‌تر کنید."
+                    )
                 )
+            else:
+                with open(zip_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=SUDO_USER_ID,
+                        document=f,
+                        filename=os.path.basename(zip_path),
+                        caption=f"💾 بکاپ روزانه (شامل Public)\nحجم: {file_size_kb:.1f} KB"
+                    )
         except Exception as e:
             logging.error(f"Failed to send backup ZIP to sudo: {e}")
         finally:

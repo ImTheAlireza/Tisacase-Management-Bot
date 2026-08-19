@@ -31,6 +31,7 @@ import pytest
 from main import TelegramLogHandler
 from handlers.reviewer import _send_media_with_retry
 from telegram.error import RetryAfter
+from config.settings import TELEGRAM_SEND_DELAY
 
 
 def _make_retry_after(seconds: int) -> RetryAfter:
@@ -161,7 +162,9 @@ class TestSendMediaWithRetry:
 
         assert result == 'sent'
         assert calls['n'] == 2
-        assert sleeps == [1]
+        # One sleep for the RetryAfter wait, plus the pacing delay applied in
+        # send_with_retry's finally block after every request.
+        assert sleeps == [1, TELEGRAM_SEND_DELAY]
 
     @pytest.mark.asyncio
     async def test_gives_up_after_max_retries(self, monkeypatch):
@@ -183,5 +186,6 @@ class TestSendMediaWithRetry:
             await _send_media_with_retry(send, 'Print 1/1')
 
         # One sleep before each of the first two retries; the final attempt
-        # raises immediately without sleeping again.
-        assert sleeps == [2, 2]
+        # raises immediately without sleeping again. The trailing entry is the
+        # pacing delay from send_with_retry's finally block.
+        assert sleeps == [2, 2, TELEGRAM_SEND_DELAY]

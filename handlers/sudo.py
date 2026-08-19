@@ -10,7 +10,7 @@ from models.user import User
 from models.product_line import ProductLine
 from services.backup_service import BackupService
 from utils.helpers import get_tehran_time, send_with_retry, safe_answer_callback
-from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS
+from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS, TELEGRAM_UPLOAD_LIMIT_BYTES
 from utils.enums import DesignStatus
 from utils.callback_lock import deduplicate_callback
 
@@ -132,13 +132,24 @@ async def backup_type_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         try:
-            file_size = os.path.getsize(zip_path) / 1024
+            file_size = os.path.getsize(zip_path)
+            file_size_kb = file_size / 1024
+
+            if file_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+                await query.edit_message_text(
+                    f"⚠️ بکاپ ساخته شد اما حجم آن "
+                    f"({file_size_kb / 1024:.1f} MB) از سقف تلگرام "
+                    f"({TELEGRAM_UPLOAD_LIMIT_BYTES // (1024 * 1024)} MB) بیشتر است "
+                    f"و قابل ارسال نیست."
+                )
+                return
+
             with open(zip_path, 'rb') as f:
                 await context.bot.send_document(
                     chat_id=SUDO_USER_ID,
                     document=f,
                     filename=os.path.basename(zip_path),
-                    caption=f"💾 بکاپ کامل\nحجم: {file_size:.1f} KB"
+                    caption=f"💾 بکاپ کامل\nحجم: {file_size_kb:.1f} KB"
                 )
             await query.delete_message()
         finally:
@@ -239,8 +250,13 @@ async def confirm_restore_callback(update: Update, context: ContextTypes.DEFAULT
         from services.restore_service import RestoreService
 
         # Step 1: Restore database
+        # Offload to a thread: restore_database runs a mysql subprocess and
+        # blocking DB calls, and must not freeze the event loop (all updates
+        # would stop responding for the duration of the restore).
         try:
-            db_result = RestoreService.restore_database(pending['sql_path'])
+            db_result = await asyncio.to_thread(
+                RestoreService.restore_database, pending['sql_path']
+            )
             if not db_result['success']:
                 await query.edit_message_text(
                     f"❌ خطا در ریستور دیتابیس:\n{db_result['error'][:300]}"
@@ -252,10 +268,12 @@ async def confirm_restore_callback(update: Update, context: ContextTypes.DEFAULT
             shutil.rmtree(pending['temp_dir'], ignore_errors=True)
             return
 
-        # Step 2: Restore public files
+        # Step 2: Restore public files (blocking file I/O → run in a thread)
         await query.edit_message_text("⏳ در حال بازنویسی فایل‌های public...")
         try:
-            files_result = RestoreService.restore_public_files(pending['zip_path'])
+            files_result = await asyncio.to_thread(
+                RestoreService.restore_public_files, pending['zip_path']
+            )
         except Exception as e:
             files_result = {'success': False, 'error': str(e)}
 
@@ -277,12 +295,12 @@ async def confirm_restore_callback(update: Update, context: ContextTypes.DEFAULT
 
         await query.edit_message_text('\n'.join(msg_lines))
 
-        # Step 5: Restart bot
+        # Step 5: Restart bot (blocking subprocess → run in a thread)
         await context.bot.send_message(
             chat_id=SUDO_USER_ID,
             text="🔄 ربات در حال ریستارت برای اعمال تغییرات..."
         )
-        RestoreService.restart_bot()
+        await asyncio.to_thread(RestoreService.restart_bot)
 
 
 @require_sudo

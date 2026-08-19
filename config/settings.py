@@ -5,13 +5,45 @@ from utils.enums import DesignStatus
 
 load_dotenv()
 
+# ==================== REQUIRED ENVIRONMENT VARIABLES ====================
+# Validate presence BEFORE any parsing so a missing variable produces a clear
+# message instead of e.g. `int(None)` raising an obscure TypeError.
+required_env_vars = [
+    'MAIN_BOT_TOKEN',
+    'MAIN_ALIREZA_CHAT_ID',
+    'MAIN_NAZI_CHAT_ID',
+    'MAIN_LOG_GROUP_ID',
+    'MAIN_DB_HOST',
+    'MAIN_DB_USER',
+    'MAIN_DB_PASSWORD',
+    'MAIN_DB_NAME'
+]
+
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    logging.error(f"❌ Missing environment variables: {missing_vars}")
+    exit(1)
+
+
+def _require_int_env(name: str) -> int:
+    """Read an integer env var; exit with a clear message on invalid input."""
+    raw = os.getenv(name)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logging.error(
+            f"❌ Environment variable {name} must be an integer, got: {raw!r}"
+        )
+        exit(1)
+
+
 # ==================== BOT CONFIGURATION ====================
 BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 
 # ==================== CHAT IDS ====================
-SUDO_USER_ID = int(os.getenv("MAIN_ALIREZA_CHAT_ID"))
-NAZI_CHAT_ID = int(os.getenv("MAIN_NAZI_CHAT_ID"))
-LOG_GROUP_ID = int(os.getenv("MAIN_LOG_GROUP_ID"))
+SUDO_USER_ID = _require_int_env("MAIN_ALIREZA_CHAT_ID")
+NAZI_CHAT_ID = _require_int_env("MAIN_NAZI_CHAT_ID")
+LOG_GROUP_ID = _require_int_env("MAIN_LOG_GROUP_ID")
 
 # ==================== DATABASE CONFIGURATION ====================
 DB_CONFIG = {
@@ -42,22 +74,14 @@ DEFAULT_PRODUCT_LINES = [
     }
 ]
 
-# ==================== VALIDATION ====================
-required_env_vars = [
-    'MAIN_BOT_TOKEN',
-    'MAIN_ALIREZA_CHAT_ID',
-    'MAIN_NAZI_CHAT_ID',
-    'MAIN_LOG_GROUP_ID',
-    'MAIN_DB_HOST',
-    'MAIN_DB_USER',
-    'MAIN_DB_PASSWORD',
-    'MAIN_DB_NAME'
-]
-
-missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-if missing_vars:
-    logging.error(f"❌ Missing environment variables: {missing_vars}")
-    exit(1)
+# ==================== TELEGRAM UPLOAD / LOG FORWARDING ====================
+# Bot API document upload limit is 50 MB for the standard bot API.
+TELEGRAM_UPLOAD_LIMIT_BYTES = int(os.getenv(
+    'TELEGRAM_UPLOAD_LIMIT_BYTES', str(50 * 1024 * 1024)
+))
+# Minimum level forwarded to the Telegram log group. Default INFO preserves the
+# current behaviour; set to e.g. WARNING to reduce log-group noise.
+TELEGRAM_LOG_LEVEL = os.getenv('TELEGRAM_LOG_LEVEL', 'INFO').upper()
 
 # ==================== ROLES ====================
 ROLES = {
