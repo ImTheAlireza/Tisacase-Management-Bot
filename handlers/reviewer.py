@@ -1,6 +1,11 @@
 import asyncio
 import html
-from telegram import Update, InputFile
+from telegram import (
+    Update,
+    InputFile,
+    InputMediaPhoto,
+    InputMediaDocument,
+)
 from telegram.ext import ContextTypes
 from utils.decorators import require_role
 from models.design import Design
@@ -8,7 +13,12 @@ from models.design_group_message import DesignGroupMessage
 from models.user import User
 from models.product_line import ProductLine
 from utils.helpers import safe_edit_message, delete_messages, send_with_retry, safe_answer_callback
-from config.settings import SUDO_USER_ID, MAX_FILE_SIZE_DOWNLOAD_MB, LOG_GROUP_ID
+from config.settings import (
+    SUDO_USER_ID,
+    MAX_FILE_SIZE_DOWNLOAD_MB,
+    MEDIA_GROUP_MAX_UPLOAD_BYTES,
+    LOG_GROUP_ID,
+)
 import logging
 from io import BytesIO
 from utils.enums import DesignStatus
@@ -494,120 +504,24 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # ── Send files to groups ──────────────────────────────
+        # One mockup/print file is sent as a regular message; two or more are
+        # sent as Telegram albums (media groups) of up to 10 items each.
         mockup_results = []  # (file_id, success, detail)
         print_results = []   # (file_id, success, detail)
+        unique_prints = list(dict.fromkeys(design.print_file_ids))
 
         if is_configured:
 
             # ── MOCKUPS → PRODUCTS GROUP ──────────────────────
-            for i, fid in enumerate(design.mockup_file_ids):
-                cap = f"کد: {code} ({i+1}/{len(design.mockup_file_ids)})"
-                has_type = fid in design.file_types
-                is_photo = design.file_types.get(fid) == 'photo'
-                label = f"Mockup {i+1}/{len(design.mockup_file_ids)}"
-
-                try:
-                    # ── Fallback: if file_types is missing, try photo then document
-                    if not has_type:
-                        try:
-                            m = await send_with_retry(
-                                lambda: context.bot.send_photo(
-                                    product_line.group_products, photo=fid, caption=cap
-                                ),
-                                label
-                            )
-                        except Exception:
-                            m = await send_with_retry(
-                                lambda: context.bot.send_document(
-                                    product_line.group_products, document=fid, caption=cap
-                                ),
-                                f"{label} (document fallback)"
-                            )
-                    elif is_photo:
-                        m = await send_with_retry(
-                            lambda: context.bot.send_photo(
-                                product_line.group_products, photo=fid, caption=cap
-                            ),
-                            label
-                        )
-                    else:
-                        m = await send_with_retry(
-                            lambda: context.bot.send_document(
-                                product_line.group_products, document=fid, caption=cap
-                            ),
-                            label
-                        )
-
-                    # Record in DB
-                    try:
-                        DesignGroupMessage.record(
-                            design_id=design.id, code=code, group_type='products',
-                            chat_id=product_line.group_products, message_id=m.message_id,
-                            file_id=fid, file_index=i
-                        )
-                    except Exception as record_err:
-                        logging.exception(f"{LOG_TAG} Mockup {i+1} RECORDBAD: {code}")
-
-                    mockup_results.append((fid, True, f"msg={m.message_id}"))
-                    logging.info(f"{LOG_TAG} {label} OK → {product_line.group_products}")
-
-                except Exception as e:
-                    logging.exception(f"{LOG_TAG} {label} FAILED: {code} | fid={fid[:30]}")
-                    mockup_results.append((fid, False, str(e)[:100]))
+            mockup_results = await _send_mockups_to_products_group(
+                context.bot, design, product_line, code
+            )
 
             # ── PRINT FILES → PRINT GROUP ─────────────────────
-            unique_prints = list(dict.fromkeys(design.print_file_ids))
-            print_count = len(unique_prints)
-            # Caption under each print file: "[product line] - [code]"
-            print_caption = f"{product_line.name_fa} - {code}"
-
-            for i, fid in enumerate(unique_prints):
-                label = f"Print {i+1}/{print_count}"
-                try:
-                    file = await context.bot.get_file(fid)
-
-                    if file.file_path and '.' in file.file_path:
-                        ext = file.file_path.split('.')[-1].lower()
-                    else:
-                        ext = 'png'
-
-                    new_filename = f"{code}.{ext}" if print_count == 1 else f"{code}_{i+1}.{ext}"
-
-                    max_size_bytes = MAX_FILE_SIZE_DOWNLOAD_MB * 1024 * 1024
-                    if file.file_size and file.file_size > max_size_bytes:
-                        m = await send_with_retry(
-                            lambda: context.bot.send_document(
-                                chat_id=product_line.group_print, document=fid,
-                                caption=f"{print_caption}\n⚠️ {new_filename} (فایل بزرگ — نام تغییر نکرد)"
-                            ),
-                            label
-                        )
-                    else:
-                        file_bytes = await file.download_as_bytearray()
-                        m = await send_with_retry(
-                            lambda: context.bot.send_document(
-                                chat_id=product_line.group_print,
-                                document=InputFile(BytesIO(file_bytes), filename=new_filename),
-                                caption=print_caption
-                            ),
-                            label
-                        )
-
-                    try:
-                        DesignGroupMessage.record(
-                            design_id=design.id, code=code, group_type='print',
-                            chat_id=product_line.group_print, message_id=m.message_id,
-                            file_id=fid, file_index=i
-                        )
-                    except Exception as record_err:
-                        logging.exception(f"{LOG_TAG} Print {i+1} RECORDBAD: {code}")
-
-                    print_results.append((fid, True, f"fn={new_filename} msg={m.message_id}"))
-                    logging.info(f"{LOG_TAG} {label} OK → {product_line.group_print}")
-
-                except Exception as e:
-                    logging.exception(f"{LOG_TAG} {label} FAILED: {code} | fid={fid[:30]}")
-                    print_results.append((fid, False, str(e)[:100]))
+            print_results = await _send_prints_to_print_group(
+                context.bot, design, unique_prints,
+                product_line.group_print, code, product_line.name_fa
+            )
 
         else:
             reason = "product_line is None" if not product_line else f"missing: {product_line.missing_groups()}"
@@ -689,6 +603,353 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _cleanup_after_decision(context, design, user.user_id, code)
 
     logging.info(f"{LOG_TAG} END | {code} | {action}")
+
+
+# ---------------------------------------------------------------------------
+# Group delivery — albums (media groups)
+# ---------------------------------------------------------------------------
+
+# Telegram rejects albums with fewer than 2 or more than 10 items.
+MAX_MEDIA_GROUP_ITEMS = 10
+MOCKUP_PHOTO_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
+
+
+def _media_group_ranges(count: int, size: int = MAX_MEDIA_GROUP_ITEMS) -> list:
+    """Split ``count`` items into [start, end) ranges of at most ``size``.
+
+    Albums need 2-10 items, so a lone trailing item would have to be sent on
+    its own; when that happens it is paired with the previous range instead
+    (e.g. 11 files → 9 + 2) so everything still travels as an album.
+    """
+    ranges = [(start, min(start + size, count)) for start in range(0, count, size)]
+    if len(ranges) > 1 and ranges[-1][1] - ranges[-1][0] == 1:
+        prev_start, prev_end = ranges[-2]
+        ranges[-2] = (prev_start, prev_end - 1)
+        ranges[-1] = (ranges[-1][0] - 1, ranges[-1][1])
+    return ranges
+
+
+def _record_group_file(design: Design, code: str, group_type: str, chat_id: int,
+                       message_id: int, file_id: str, file_index: int) -> None:
+    """Best-effort DB record of one sent group message (never raises)."""
+    try:
+        DesignGroupMessage.record(
+            design_id=design.id, code=code, group_type=group_type,
+            chat_id=chat_id, message_id=message_id,
+            file_id=file_id, file_index=file_index
+        )
+    except Exception:
+        logging.exception(f"{LOG_TAG} {group_type} #{file_index + 1} RECORDBAD: {code}")
+
+
+async def _resolve_mockup_kind(bot, fid: str, file_types: dict) -> str:
+    """Return 'photo', 'document' or 'unknown' for one mockup file_id.
+
+    ``file_types`` (written at upload time) is authoritative. Designs created
+    before that field existed are resolved from the Telegram file path;
+    'unknown' means the caller must send the file on its own (photo → document
+    fallback), because albums need the type up front.
+    """
+    kind = (file_types or {}).get(fid)
+    if kind in ('photo', 'document'):
+        return kind
+    try:
+        file = await bot.get_file(fid)
+    except Exception as e:
+        logging.warning(f"{LOG_TAG} mockup type lookup failed for {str(fid)[:30]}: {e}")
+        return 'unknown'
+    path = file.file_path or ''
+    ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
+    if ext in MOCKUP_PHOTO_EXTENSIONS:
+        return 'photo'
+    return 'document' if ext else 'unknown'
+
+
+def _mockup_media(fid: str, kind: str, caption: str):
+    """Build one album item for a mockup."""
+    if kind == 'photo':
+        return InputMediaPhoto(media=fid, caption=caption)
+    return InputMediaDocument(media=fid, caption=caption)
+
+
+async def _send_one_mockup(bot, chat_id: int, fid: str, kind: str, caption: str, label: str):
+    """Send a single mockup; unknown legacy types try photo, then document."""
+    if kind == 'document':
+        return await send_with_retry(
+            lambda: bot.send_document(chat_id, document=fid, caption=caption), label
+        )
+    try:
+        return await send_with_retry(
+            lambda: bot.send_photo(chat_id, photo=fid, caption=caption), label
+        )
+    except Exception:
+        if kind == 'photo':
+            raise
+        return await send_with_retry(
+            lambda: bot.send_document(chat_id, document=fid, caption=caption),
+            f"{label} (document fallback)"
+        )
+
+
+async def _send_mockups_to_products_group(bot, design: Design, product_line, code: str) -> list:
+    """Deliver approved mockups to the product line's products group.
+
+    A single mockup is sent as a normal photo/document. Two or more are sent
+    as albums of up to 10 items, with the caption on the first item of each
+    album. If an album fails, its files are retried individually so one bad
+    item cannot lose the rest.
+
+    Returns the ``(file_id, ok, detail)`` results used by the approve summary.
+    """
+    mockups = list(design.mockup_file_ids)
+    total = len(mockups)
+    results: list = []
+    if not mockups:
+        return results
+
+    chat_id = product_line.group_products
+    kinds = {fid: await _resolve_mockup_kind(bot, fid, design.file_types) for fid in mockups}
+
+    for start, end in _media_group_ranges(total):
+        chunk = mockups[start:end]
+        # Albums must hold 2-10 items; a single file, and any chunk with an
+        # unresolved legacy type, go out one request per file.
+        as_album = len(chunk) > 1 and all(kinds[fid] != 'unknown' for fid in chunk)
+        label = f"Mockups {start + 1}-{end}/{total} → products group"
+
+        if as_album:
+            caption = f"کد: {code} ({start + 1}-{end}/{total})"
+            media = [
+                _mockup_media(fid, kinds[fid], caption if offset == 0 else "")
+                for offset, fid in enumerate(chunk)
+            ]
+            try:
+                msgs = await send_with_retry(
+                    lambda: bot.send_media_group(chat_id, media=media), label
+                )
+            except Exception as e:
+                logging.error(f"{LOG_TAG} {label} ALBUM FAILED: {code} | {e}")
+                msgs = None
+
+            if msgs:
+                for offset, (fid, msg) in enumerate(zip(chunk, msgs)):
+                    index = start + offset
+                    _record_group_file(design, code, 'products', chat_id,
+                                       msg.message_id, fid, index)
+                    results.append((fid, True, f"msg={msg.message_id}"))
+                    logging.info(f"{LOG_TAG} Mockup {index + 1}/{total} OK → {chat_id}")
+                continue
+
+        for offset, fid in enumerate(chunk):
+            index = start + offset
+            file_label = f"Mockup {index + 1}/{total}"
+            cap = f"کد: {code} ({index + 1}/{total})"
+            try:
+                msg = await _send_one_mockup(bot, chat_id, fid, kinds[fid], cap, file_label)
+                _record_group_file(design, code, 'products', chat_id,
+                                   msg.message_id, fid, index)
+                results.append((fid, True, f"msg={msg.message_id}"))
+                logging.info(f"{LOG_TAG} {file_label} OK → {chat_id}")
+            except Exception as e:
+                logging.exception(f"{LOG_TAG} {file_label} FAILED: {code} | fid={str(fid)[:30]}")
+                results.append((fid, False, str(e)[:100]))
+
+    return results
+
+
+async def _describe_print_file(bot, fid: str, code: str, index: int, total: int,
+                               max_size_bytes: int) -> dict:
+    """Resolve the renamed filename, size and file handle for one print file.
+
+    Files above the download limit keep their original name and are sent by
+    file_id; smaller ones are re-uploaded as ``{code}_{n}.{ext}``. The payload
+    itself is downloaded later, per album, to keep memory usage bounded.
+    """
+    file = await bot.get_file(fid)
+    path = file.file_path or ''
+    ext = path.rsplit('.', 1)[-1].lower() if '.' in path else 'png'
+    filename = f"{code}.{ext}" if total == 1 else f"{code}_{index + 1}.{ext}"
+    large = bool(file.file_size and file.file_size > max_size_bytes)
+    return {
+        'file_id': fid,
+        'filename': filename,
+        'large': large,
+        'size': 0 if large else int(file.file_size or 0),
+        'index': index,
+        'file': file,
+        'data': None,
+    }
+
+
+async def _load_print_payload(item: dict) -> None:
+    """Download the bytes needed to re-upload one print file (idempotent)."""
+    if item['large'] or item['data'] is not None:
+        return
+    item['data'] = await item['file'].download_as_bytearray()
+
+
+def _group_print_items(items: list, max_count: int, max_bytes: int) -> list:
+    """Group consecutive print files into album-sized batches.
+
+    Each batch holds at most ``max_count`` items and at most ``max_bytes`` of
+    upload payload — files sent by file_id are not uploaded and do not count.
+    A single-item tail is merged into the previous batch when it fits, because
+    albums need at least two items.
+    """
+    groups: list = []
+    current: list = []
+    current_bytes = 0
+
+    for item in items:
+        if current and (len(current) >= max_count or current_bytes + item['size'] > max_bytes):
+            groups.append(current)
+            current, current_bytes = [], 0
+        current.append(item)
+        current_bytes += item['size']
+    if current:
+        groups.append(current)
+
+    if len(groups) > 1 and len(groups[-1]) == 1 and len(groups[-2]) >= 3:
+        moved = groups[-2][-1]
+        if groups[-1][0]['size'] + moved['size'] <= max_bytes:
+            groups[-1].insert(0, groups[-2].pop())
+    return groups
+
+
+def _print_media(item: dict, caption: str):
+    """Album item for one print file (InputFile is rebuilt on every attempt)."""
+    if item['large']:
+        return InputMediaDocument(media=item['file_id'], caption=caption)
+    return InputMediaDocument(
+        media=InputFile(BytesIO(item['data']), filename=item['filename']),
+        caption=caption
+    )
+
+
+def _large_file_note(item: dict) -> str:
+    return f"⚠️ {item['filename']} (فایل بزرگ — نام تغییر نکرد)"
+
+
+async def _send_one_print(bot, chat_id: int, item: dict, caption: str, label: str):
+    """Send a single print document (single files, lone tail, fallbacks)."""
+    await _load_print_payload(item)
+    if item['large']:
+        return await send_with_retry(
+            lambda: bot.send_document(
+                chat_id, document=item['file_id'],
+                caption=f"{caption}\n{_large_file_note(item)}"
+            ),
+            label
+        )
+    return await send_with_retry(
+        lambda: bot.send_document(
+            chat_id,
+            document=InputFile(BytesIO(item['data']), filename=item['filename']),
+            caption=caption
+        ),
+        label
+    )
+
+
+async def _send_prints_to_print_group(bot, design: Design, prints: list, chat_id: int,
+                                      code: str, product_name: str) -> list:
+    """Deliver approved print files to the print group.
+
+    A single file keeps the old single-document behaviour. Two or more are
+    uploaded as albums of renamed documents (``{code}_{n}.{ext}``), split by
+    both item count and upload size. Albums that fail fall back to per-file
+    sends so one bad item cannot lose the rest.
+
+    Returns the ``(file_id, ok, detail)`` results used by the approve summary.
+    """
+    total = len(prints)
+    results: list = []
+    if not prints:
+        return results
+
+    caption_base = f"{product_name} - {code}"
+    max_size_bytes = MAX_FILE_SIZE_DOWNLOAD_MB * 1024 * 1024
+
+    # Pass 1: resolve names/sizes so albums can be planned before any payload
+    # is downloaded; failed lookups are reported without blocking the rest.
+    items: list = []
+    for index, fid in enumerate(prints):
+        try:
+            items.append(await _describe_print_file(
+                bot, fid, code, index, total, max_size_bytes
+            ))
+        except Exception as e:
+            logging.exception(
+                f"{LOG_TAG} Print {index + 1}/{total} LOOKUP FAILED: {code} | fid={str(fid)[:30]}"
+            )
+            results.append((fid, False, str(e)[:100]))
+
+    if not items:
+        return results
+
+    for group in _group_print_items(items, MAX_MEDIA_GROUP_ITEMS, MEDIA_GROUP_MAX_UPLOAD_BYTES):
+        first, last = group[0]['index'] + 1, group[-1]['index'] + 1
+        label = f"Prints {first}-{last}/{total} → print group"
+        caption = caption_base if total == 1 else f"{caption_base} ({first}-{last}/{total})"
+        large_notes = [_large_file_note(item) for item in group if item['large']]
+        first_caption = caption + ("\n" + "\n".join(large_notes) if large_notes else "")
+
+        if len(group) > 1:
+            # Payloads live only as long as their album (bounded by the size cap).
+            downloaded = True
+            for item in group:
+                try:
+                    await _load_print_payload(item)
+                except Exception as e:
+                    downloaded = False
+                    logging.exception(
+                        f"{LOG_TAG} Print {item['index'] + 1}/{total} DOWNLOAD FAILED: {code} | {e}"
+                    )
+
+            if downloaded:
+                def _build_media(group=group, first_caption=first_caption):
+                    return [
+                        _print_media(item, first_caption if position == 0 else "")
+                        for position, item in enumerate(group)
+                    ]
+
+                try:
+                    msgs = await send_with_retry(
+                        lambda: bot.send_media_group(chat_id, media=_build_media()), label
+                    )
+                except Exception as e:
+                    logging.error(f"{LOG_TAG} {label} ALBUM FAILED: {code} | {e}")
+                    msgs = None
+
+                if msgs:
+                    for item, msg in zip(group, msgs):
+                        _record_group_file(design, code, 'print', chat_id,
+                                           msg.message_id, item['file_id'], item['index'])
+                        results.append((item['file_id'], True,
+                                        f"fn={item['filename']} msg={msg.message_id}"))
+                        logging.info(f"{LOG_TAG} Print {item['index'] + 1}/{total} OK → {chat_id}")
+                    continue
+
+        for item in group:
+            index = item['index']
+            item_label = f"Print {index + 1}/{total}"
+            item_caption = caption_base if total == 1 else (
+                f"{caption_base} ({index + 1}/{total})"
+            )
+            try:
+                msg = await _send_one_print(bot, chat_id, item, item_caption, item_label)
+                _record_group_file(design, code, 'print', chat_id,
+                                   msg.message_id, item['file_id'], index)
+                results.append((item['file_id'], True,
+                                f"fn={item['filename']} msg={msg.message_id}"))
+                logging.info(f"{LOG_TAG} {item_label} OK → {chat_id}")
+            except Exception as e:
+                logging.exception(
+                    f"{LOG_TAG} {item_label} FAILED: {code} | fid={str(item['file_id'])[:30]}"
+                )
+                results.append((item['file_id'], False, str(e)[:100]))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
