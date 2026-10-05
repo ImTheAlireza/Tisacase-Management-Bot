@@ -79,6 +79,12 @@ DEFAULT_PRODUCT_LINES = [
 TELEGRAM_UPLOAD_LIMIT_BYTES = int(os.getenv(
     'TELEGRAM_UPLOAD_LIMIT_BYTES', str(50 * 1024 * 1024)
 ))
+# Maximum upload payload for one Telegram album (media group). Print files are
+# re-uploaded to rename them, so bigger sets are split into more albums to keep
+# each request small enough for the API write timeout.
+MEDIA_GROUP_MAX_UPLOAD_BYTES = int(os.getenv(
+    'MEDIA_GROUP_MAX_UPLOAD_BYTES', str(40 * 1024 * 1024)
+))
 # Minimum level forwarded to the Telegram log group. Default INFO preserves the
 # current behaviour; set to e.g. WARNING to reduce log-group noise.
 TELEGRAM_LOG_LEVEL = os.getenv('TELEGRAM_LOG_LEVEL', 'INFO').upper()
