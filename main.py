@@ -32,6 +32,7 @@ from migrations.migration_006_create_design_group_messages import Migration006
 from migrations.migration_007_add_deleted_status import Migration007
 from migrations.migration_008_add_stats_reset import Migration008
 from migrations.migration_009_add_file_types import Migration009
+from migrations.migration_010_add_bot_settings import Migration010
 
 # Handlers
 from handlers.common import start_command, cancel_command
@@ -42,7 +43,8 @@ from handlers.sudo import (
     handle_group_id_input, status_command, broadcast_update_callback,
     delete_design_command, confirm_delete_design_callback,
     cleanup_orphans_command, confirm_restore_callback,
-    backup_type_callback, csv_range_callback
+    backup_type_callback, csv_range_callback,
+    auto_detect_command, auto_detect_callback
 )
 from handlers.reset_stats import reset_stats_command, reset_stats_callback
 from handlers.stats import stats_command, stats_callback
@@ -149,7 +151,8 @@ def run_db_migrations():
     migrations = [
         Migration001(), Migration002(), Migration003(),
         Migration004(), Migration005(), Migration006(),
-        Migration007(), Migration008(), Migration009()
+        Migration007(), Migration008(), Migration009(),
+        Migration010()
     ]
     manager = MigrationManager()
     manager.run_migrations(migrations)
@@ -287,6 +290,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "⚙️ تنظیم گروه‌ها":
         return await group_management_command(update, context)
+
+    if text == "🤖 تشخیص خودکار":
+        return await auto_detect_command(update, context)
 
     if text == "📊 وضعیت":
         return await status_command(update, context)
@@ -514,6 +520,9 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("deletedesign",  delete_design_command))
     application.add_handler(CommandHandler("cleanup",       cleanup_orphans_command))
 
+    # Auto detection of mockup vs print files (sudo)
+    application.add_handler(CommandHandler("autodetect",    auto_detect_command))
+
     # -----------------------------------------------------------------------
     # Text routing & Files
     # -----------------------------------------------------------------------
@@ -540,7 +549,7 @@ if __name__ == "__main__":
     # Editor stage flow
     application.add_handler(CallbackQueryHandler(
         editor_callbacks,
-        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission|cancel_editing|manage_mockups|manage_prints|manage_clear_mockup|manage_clear_print|manage_back|remove_mockup_\d+|remove_print_\d+)$"
+        pattern=r"^(stage_mockup_done|stage_print_done|stage_goto_mockup|stage_goto_print|back_to_workspace|stage_mockup_clear|stage_print_clear|clear_confirmed_mockup|clear_confirmed_print|clear_cancelled_mockup|clear_cancelled_print|confirm_submit|submit_to_reviewer|preview_files|cancel_submission|cancel_editing|manage_mockups|manage_prints|manage_clear_mockup|manage_clear_print|manage_back|stage_auto_done|stage_auto_clear|stage_goto_auto|clear_confirmed_auto|clear_cancelled_auto|remove_mockup_\d+|remove_print_\d+)$"
     ))
 
     # Reviewer
@@ -559,6 +568,12 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(
         group_management_callback,
         pattern=r"^setgroup_"
+    ))
+
+    # Auto detection toggle (sudo)
+    application.add_handler(CallbackQueryHandler(
+        auto_detect_callback,
+        pattern=r"^(autodetect_on|autodetect_off)$"
     ))
 
     # Log forwarding

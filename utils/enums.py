@@ -31,8 +31,11 @@ class EditorStage(str, Enum):
     Stages of the editor file submission flow.
     Linear: mockup → print → confirm
     With workspace as editing hub.
+    AUTO replaces mockup+print when Sudo enabled auto detection:
+    photos are stored as mockups and documents as print files.
     """
     MOCKUP    = "mockup"
     PRINT     = "print"
     CONFIRM   = "confirm"
     WORKSPACE = "workspace"
+    AUTO      = "auto"
