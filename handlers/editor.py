@@ -22,7 +22,6 @@ from services.code_service import CodeService
 from models.product_line import ProductLine
 from models.design import Design
 from models.user import User
-from models.bot_settings import BotSettings
 from ui.keyboards import Keyboards
 
 # ---------------------------------------------------------------------------
@@ -242,8 +241,11 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['print_files'] = design.print_file_ids.copy()
     context.user_data['file_types'] = design.file_types.copy()
     context.user_data['editing_existing'] = True  # Flag to indicate edit mode
-    # Snapshot the auto-detect option for this session
-    context.user_data['auto_detect'] = BotSettings.is_auto_detect_enabled()
+    # Snapshot this editor's personal auto-detect option for the session
+    editor_user = User.get_by_id(user_id)
+    context.user_data['auto_detect'] = bool(
+        editor_user and editor_user.auto_detect_files
+    )
 
     # Send workspace message
     text, markup = Keyboards.get_workspace_stage(
@@ -289,7 +291,7 @@ async def start_new_design(
     """
     Entry point when editor taps a product line button.
     Generates code, enters mockup stage immediately
-    (or the auto-detect stage when Sudo enabled auto detection).
+    (or the auto-detect stage when the editor enabled it for themselves).
     """
     user = context.user_data['db_user']
     user_id = user.user_id
@@ -350,11 +352,11 @@ async def start_new_design(
 
     product = ProductLine.get_by_id(design.product_line_id)
 
-    # Snapshot the auto-detect option for this session
-    auto_detect = BotSettings.is_auto_detect_enabled()
+    # Snapshot this editor's personal auto-detect option for the session
+    auto_detect = bool(user.auto_detect_files)
 
     # Set initial state — enter mockup stage directly,
-    # or the single auto-detect stage when Sudo enabled it
+    # or the single auto-detect stage when the editor enabled it
     context.user_data['code']         = code
     context.user_data['product_id']   = product.id
     context.user_data['product_name'] = product.name_fa
@@ -378,6 +380,68 @@ async def start_new_design(
 
     # Start inactivity timer
     _reset_inactivity_timer(context, update.effective_chat.id)
+
+# ---------------------------------------------------------------------------
+# Personal Option — Auto Detect Mockup vs Print Files
+# ---------------------------------------------------------------------------
+
+def _auto_detect_panel(enabled: bool) -> Tuple[str, InlineKeyboardMarkup]:
+    """Text + toggle button for the editor's personal auto-detect option."""
+    text = (
+        "🤖 تشخیص خودکار موکاپ و چاپی\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        f"وضعیت شما: {'🟢 روشن' if enabled else '🔴 خاموش'}\n\n"
+        "در حالت روشن:\n"
+        "• دکمه‌های «اتمام ثبت موکاپ» و «اتمام ثبت فایل چاپی» نمایش داده نمی‌شوند\n"
+        "• مستقیم دکمه «✅ اتمام ارسال» را می‌بینید\n"
+        "• 📷 عکس معمولی → موکاپ\n"
+        "• 📎 فایل (Document) → چاپی\n\n"
+        "⚠️ این تنظیم فقط برای خودتان است و از ثبت بعدی اعمال می‌شود."
+    )
+
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔴 خاموش کردن" if enabled else "🟢 روشن کردن",
+            callback_data="autodetect_off" if enabled else "autodetect_on"
+        )
+    ]])
+
+    return text, markup
+
+
+@require_role('editor')
+async def auto_detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the editor's personal auto-detect status with a toggle button."""
+    user: User = context.user_data['db_user']
+    enabled = bool(user.auto_detect_files)
+
+    text, markup = _auto_detect_panel(enabled)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+@require_role('editor')
+async def auto_detect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle auto detection for the editor who pressed the button — nobody else."""
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    user: User = context.user_data['db_user']
+    enable: bool = query.data == "autodetect_on"
+
+    try:
+        user.set_auto_detect_enabled(enable)
+    except Exception as e:
+        logging.error(f"Failed to toggle auto detect for {user.user_id}: {e}")
+        await safe_answer_callback(query, "❌ ذخیره تنظیم ناموفق بود", show_alert=True)
+        return
+
+    # An already running session keeps its flow — applies from the next design
+    text, markup = _auto_detect_panel(bool(user.auto_detect_files))
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception as e:
+        logging.warning(f"Could not update auto-detect message: {e}")
+
 
 # ---------------------------------------------------------------------------
 # File Handler — Stage Aware

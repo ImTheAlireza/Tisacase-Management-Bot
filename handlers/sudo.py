@@ -568,69 +568,6 @@ async def handle_group_id_input(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 @require_sudo
-async def auto_detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the auto-detect option (mockup vs print) status with a toggle"""
-    from models.bot_settings import BotSettings
-
-    enabled = BotSettings.is_auto_detect_enabled()
-
-    keyboard = [[InlineKeyboardButton(
-        "🔴 خاموش کردن" if enabled else "🟢 روشن کردن",
-        callback_data="autodetect_off" if enabled else "autodetect_on"
-    )]]
-
-    await update.message.reply_text(
-        "🤖 تشخیص خودکار موکاپ و چاپی\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"وضعیت فعلی: {'🟢 روشن' if enabled else '🔴 خاموش'}\n\n"
-        "در حالت روشن:\n"
-        "• دکمه‌های «اتمام ثبت موکاپ» و «اتمام ثبت فایل چاپی» نمایش داده نمی‌شوند\n"
-        "• طراح مستقیم دکمه «✅ اتمام ارسال» را می‌بیند\n"
-        "• 📷 عکس معمولی → موکاپ\n"
-        "• 📎 فایل (Document) → چاپی\n\n"
-        "⚠️ تغییر از ثبت بعدی اعمال می‌شود و روی جلسات باز تاثیری ندارد.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-@require_sudo
-async def auto_detect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Turn auto detection of mockup vs print files on or off"""
-    from models.bot_settings import BotSettings
-
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    enable = query.data == "autodetect_on"
-    BotSettings.set_auto_detect_enabled(enable)
-
-    text = (
-        "🤖 تشخیص خودکار موکاپ و چاپی\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"وضعیت: {'🟢 روشن' if enable else '🔴 خاموش'}\n\n"
-    )
-    text += (
-        "✅ تشخیص خودکار روشن شد.\n"
-        "از ثبت بعدی، طراح فقط دکمه «✅ اتمام ارسال» را می‌بیند:\n"
-        "📷 عکس معمولی → موکاپ\n"
-        "📎 فایل (Document) → چاپی"
-        if enable else
-        "✅ تشخیص خودکار خاموش شد.\n"
-        "از ثبت بعدی، طراح دوباره موکاپ و فایل چاپی را جداگانه ثبت می‌کند."
-    )
-
-    keyboard = [[InlineKeyboardButton(
-        "🔴 خاموش کردن" if enable else "🟢 روشن کردن",
-        callback_data="autodetect_off" if enable else "autodetect_on"
-    )]]
-
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        logging.error(f"Failed to update auto-detect message: {e}")
-
-
-@require_sudo
 async def delete_design_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /deletedesign <code>

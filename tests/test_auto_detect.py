@@ -1,9 +1,10 @@
 """
-Tests for the sudo toggle "تشخیص خودکار موکاپ و چاپی".
+Tests for the per-editor option "تشخیص خودکار موکاپ و چاپی".
 
-When the option is ON the editor sees a single upload screen:
-a plain photo is stored as a mockup, anything sent as a document is stored
-as a print file, and the only action button is "✅ اتمام ارسال".
+Every editor can turn it on/off for themselves. When it is ON their session
+skips the two upload stages: a plain photo is stored as a mockup, anything
+sent as a document is stored as a print file, and the only action button is
+"✅ اتمام ارسال".
 """
 import os
 
@@ -23,9 +24,24 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 from utils.enums import EditorStage, DesignStatus
 from ui.keyboards import Keyboards
-from models.bot_settings import BotSettings
-from handlers.editor import handle_files, start_new_design, _handle_auto_done
-from handlers.sudo import auto_detect_callback
+from models.user import User
+from handlers.editor import (
+    handle_files,
+    start_new_design,
+    editor_callbacks,
+    _handle_auto_done,
+    auto_detect_command,
+    auto_detect_callback,
+)
+
+
+@pytest.fixture(autouse=True)
+def no_rate_limit(monkeypatch):
+    """Keep the shared rate limiter out of the way of these tests."""
+    monkeypatch.setattr(
+        'utils.decorators.rate_limiter.check_rate_limit',
+        lambda user_id, action: (True, 0.0)
+    )
 
 
 def _callbacks(markup) -> set:
@@ -36,6 +52,11 @@ def _callbacks(markup) -> set:
         for btn in row
         if btn.callback_data
     }
+
+
+def _buttons(markup) -> list:
+    """All reply-keyboard button labels of a ReplyKeyboardMarkup."""
+    return [btn.text for row in markup.keyboard for btn in row]
 
 
 def _make_context(user_data: dict) -> MagicMock:
@@ -56,11 +77,19 @@ def _make_query(data: str, user_id: int = 1001) -> MagicMock:
     return query
 
 
-def _sudo_user() -> MagicMock:
+def _editor_user(auto_detect: bool = False) -> MagicMock:
+    """An active editor whose personal auto-detect flag is `auto_detect`."""
     user = MagicMock()
+    user.user_id = 1001
     user.is_active = True
-    user.is_sudo = True
+    user.is_sudo = False
+    user.role = 'editor'
     user.get_effective_role.return_value = 'editor'
+    user.auto_detect_files = auto_detect
+    # Keep the in-memory flag in sync like the real model does
+    user.set_auto_detect_enabled = MagicMock(
+        side_effect=lambda enabled: setattr(user, 'auto_detect_files', bool(enabled))
+    )
     return user
 
 
@@ -96,7 +125,7 @@ class TestAutoStageKeyboard:
         assert markup.inline_keyboard[-1][0].callback_data == "cancel_editing"
 
     def test_classic_stage_keyboards_unchanged(self):
-        """The two-step flow keeps its own buttons when auto detect is off."""
+        """The two-step flow keeps its own buttons when the option is off."""
         _, mockup_markup = Keyboards.get_mockup_stage("TS001", "قاب موبایل", 1)
         _, print_markup = Keyboards.get_print_stage("TS001", "قاب موبایل", 1, 1)
 
@@ -127,8 +156,50 @@ class TestAutoStageKeyboard:
 
     def test_clear_confirmation_for_auto_stage(self):
         _, markup = Keyboards.get_clear_confirmation("auto")
-        cbs = _callbacks(markup)
-        assert cbs == {"clear_confirmed_auto", "clear_cancelled_auto"}
+        assert _callbacks(markup) == {"clear_confirmed_auto", "clear_cancelled_auto"}
+
+
+class TestMainMenuButton:
+
+    def test_editors_get_the_option_button(self):
+        user = MagicMock()
+        user.is_sudo = False
+        user.get_effective_role.return_value = 'editor'
+
+        with patch('ui.keyboards.ProductLine.get_all_active', return_value=[]), \
+             patch('ui.keyboards.User.is_privileged_user', return_value=False):
+            keyboard = Keyboards.get_main_menu(user)
+
+        assert "🤖 تشخیص خودکار" in _buttons(keyboard)
+
+    def test_reviewers_do_not_get_the_option_button(self):
+        user = MagicMock()
+        user.is_sudo = False
+        user.get_effective_role.return_value = 'reviewer'
+
+        with patch('ui.keyboards.ProductLine.get_all_active', return_value=[]), \
+             patch('ui.keyboards.User.is_privileged_user', return_value=False):
+            keyboard = Keyboards.get_main_menu(user)
+
+        assert "🤖 تشخیص خودکار" not in _buttons(keyboard)
+
+    def test_sudo_panel_no_longer_has_the_option(self):
+        """The global sudo switch was replaced by the per-editor option."""
+        user = MagicMock()
+        user.is_sudo = True
+        user.get_effective_role.return_value = 'sudo'
+
+        with patch('ui.keyboards.ProductLine.get_all_active', return_value=[]), \
+             patch('ui.keyboards.User.is_privileged_user', return_value=True):
+            keyboard = Keyboards.get_main_menu(user)
+
+        assert "🤖 تشخیص خودکار" not in _buttons(keyboard)
+
+    def test_sudo_handler_is_gone(self):
+        import handlers.sudo as sudo_handlers
+
+        assert not hasattr(sudo_handlers, 'auto_detect_command')
+        assert not hasattr(sudo_handlers, 'auto_detect_callback')
 
 
 # ---------------------------------------------------------------------------
@@ -147,20 +218,25 @@ class TestHandleFilesAutoDetect:
         update.message.reply_text = AsyncMock()
         return update
 
-    @patch('handlers.editor.Design.get_by_code')
-    @patch('handlers.editor.User.get_by_id')
-    async def test_photo_goes_to_mockups(self, mock_user, mock_design):
-        mock_user.return_value = _sudo_user()
-        mock_design.return_value = _pending_design()
-
-        context = _make_context({
+    def _session(self, **overrides) -> dict:
+        session = {
             'code': 'TS001',
             'stage': EditorStage.AUTO,
             'auto_detect': True,
             'mockup_files': [],
             'print_files': [],
             'workspace_message_id': 5,
-        })
+        }
+        session.update(overrides)
+        return session
+
+    @patch('handlers.editor.Design.get_by_code')
+    @patch('handlers.editor.User.get_by_id')
+    async def test_photo_goes_to_mockups(self, mock_user, mock_design):
+        mock_user.return_value = _editor_user(auto_detect=True)
+        mock_design.return_value = _pending_design()
+
+        context = _make_context(self._session())
         update = self._update(photo=[MagicMock(file_id='photo_1')])
 
         await handle_files(update, context)
@@ -173,17 +249,10 @@ class TestHandleFilesAutoDetect:
     @patch('handlers.editor.Design.get_by_code')
     @patch('handlers.editor.User.get_by_id')
     async def test_document_goes_to_prints(self, mock_user, mock_design):
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=True)
         mock_design.return_value = _pending_design()
 
-        context = _make_context({
-            'code': 'TS001',
-            'stage': EditorStage.AUTO,
-            'auto_detect': True,
-            'mockup_files': [],
-            'print_files': [],
-            'workspace_message_id': 5,
-        })
+        context = _make_context(self._session())
         update = self._update(document=MagicMock(file_id='doc_1'))
 
         await handle_files(update, context)
@@ -198,18 +267,11 @@ class TestHandleFilesAutoDetect:
     async def test_files_routed_by_type_even_in_legacy_mockup_stage(
         self, mock_user, mock_design
     ):
-        """A session that started before the toggle still auto-sorts."""
-        mock_user.return_value = _sudo_user()
+        """A session started before the toggle still auto-sorts."""
+        mock_user.return_value = _editor_user(auto_detect=True)
         mock_design.return_value = _pending_design()
 
-        context = _make_context({
-            'code': 'TS001',
-            'stage': EditorStage.MOCKUP,
-            'auto_detect': True,
-            'mockup_files': [],
-            'print_files': [],
-            'workspace_message_id': 5,
-        })
+        context = _make_context(self._session(stage=EditorStage.MOCKUP))
         await handle_files(self._update(document=MagicMock(file_id='doc_9')), context)
         assert context.user_data['print_files'] == ['doc_9']
 
@@ -219,17 +281,12 @@ class TestHandleFilesAutoDetect:
         self, mock_user, mock_design
     ):
         """With the option OFF nothing changes: mockup stage keeps everything."""
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=False)
         mock_design.return_value = _pending_design()
 
-        context = _make_context({
-            'code': 'TS001',
-            'stage': EditorStage.MOCKUP,
-            'auto_detect': False,
-            'mockup_files': [],
-            'print_files': [],
-            'workspace_message_id': 5,
-        })
+        context = _make_context(self._session(
+            stage=EditorStage.MOCKUP, auto_detect=False
+        ))
         await handle_files(self._update(document=MagicMock(file_id='doc_2')), context)
 
         assert context.user_data['mockup_files'] == ['doc_2']
@@ -238,17 +295,10 @@ class TestHandleFilesAutoDetect:
     @patch('handlers.editor.Design.get_by_code')
     @patch('handlers.editor.User.get_by_id')
     async def test_confirm_stage_still_ignores_files(self, mock_user, mock_design):
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=True)
         mock_design.return_value = _pending_design()
 
-        context = _make_context({
-            'code': 'TS001',
-            'stage': EditorStage.CONFIRM,
-            'auto_detect': True,
-            'mockup_files': [],
-            'print_files': [],
-            'workspace_message_id': 5,
-        })
+        context = _make_context(self._session(stage=EditorStage.CONFIRM))
         await handle_files(self._update(photo=[MagicMock(file_id='p')]), context)
 
         assert context.user_data['mockup_files'] == []
@@ -271,7 +321,7 @@ class TestStartNewDesign:
         )
         return update
 
-    def _patched_session(self, auto_enabled: bool):
+    def _patched_session(self, user):
         product_line = MagicMock()
         product_line.id = 1
         product_line.name_fa = 'قاب موبایل'
@@ -281,20 +331,17 @@ class TestStartNewDesign:
         design.product_line_id = 1
 
         return [
-            patch('handlers.editor.User.get_by_id', return_value=_sudo_user()),
-            patch('handlers.editor.BotSettings.is_auto_detect_enabled',
-                  return_value=auto_enabled),
+            patch('handlers.editor.User.get_by_id', return_value=user),
             patch('handlers.editor.ProductLine.get_by_prefix', return_value=product_line),
             patch('handlers.editor.ProductLine.get_by_id', return_value=product_line),
             patch('handlers.editor.CodeService.generate_code',
                   return_value=('TS001', design)),
         ]
 
-    async def test_enters_auto_stage_when_enabled(self):
+    async def _start(self, user):
         context = _make_context({})
         update = self._update()
-
-        patches = self._patched_session(True)
+        patches = self._patched_session(user)
         for p in patches:
             p.start()
         try:
@@ -302,21 +349,38 @@ class TestStartNewDesign:
         finally:
             for p in patches:
                 p.stop()
+        return context, update
+
+    async def test_enters_auto_stage_when_editor_enabled_it(self):
+        context, update = await self._start(_editor_user(auto_detect=True))
 
         assert context.user_data['stage'] == EditorStage.AUTO
         assert context.user_data['auto_detect'] is True
 
-        sent_markup = update.message.reply_text.await_args.kwargs['reply_markup']
-        cbs = _callbacks(sent_markup)
+        cbs = _callbacks(update.message.reply_text.await_args.kwargs['reply_markup'])
         assert "stage_auto_done" in cbs
         assert "stage_mockup_done" not in cbs
         assert "stage_print_done" not in cbs
 
-    async def test_enters_mockup_stage_when_disabled(self):
+    async def test_enters_mockup_stage_when_editor_disabled_it(self):
+        context, update = await self._start(_editor_user(auto_detect=False))
+
+        assert context.user_data['stage'] == EditorStage.MOCKUP
+        assert context.user_data['auto_detect'] is False
+
+        cbs = _callbacks(update.message.reply_text.await_args.kwargs['reply_markup'])
+        assert cbs == {"stage_mockup_done", "stage_mockup_clear", "cancel_submission"}
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_other_editors_are_not_affected(self, mock_user):
+        """The flag is read from the user who started the design."""
+        other = _editor_user(auto_detect=False)
+        other.user_id = 2002
+        mock_user.return_value = other
+
         context = _make_context({})
         update = self._update()
-
-        patches = self._patched_session(False)
+        patches = self._patched_session(other)
         for p in patches:
             p.start()
         try:
@@ -325,13 +389,43 @@ class TestStartNewDesign:
             for p in patches:
                 p.stop()
 
-        assert context.user_data['stage'] == EditorStage.MOCKUP
         assert context.user_data['auto_detect'] is False
 
-        sent_markup = update.message.reply_text.await_args.kwargs['reply_markup']
-        assert _callbacks(sent_markup) == {
-            "stage_mockup_done", "stage_mockup_clear", "cancel_submission"
-        }
+
+@pytest.mark.asyncio
+class TestLoadDesignForEdit:
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_edit_session_snapshots_the_editor_flag(self, mock_user):
+        from handlers.editor import load_design_for_edit
+
+        mock_user.return_value = _editor_user(auto_detect=True)
+
+        design = MagicMock()
+        design.product_line_id = 1
+        design.code = 'TS001'
+        design.mockup_file_ids = ['m1']
+        design.print_file_ids = ['p1']
+        design.file_types = {}
+        design.can_be_edited_by.return_value = True
+
+        update = MagicMock()
+        update.callback_query.from_user.id = 1001
+        update.callback_query.message.reply_text = AsyncMock(
+            return_value=MagicMock(message_id=11)
+        )
+        update.callback_query.edit_message_text = AsyncMock()
+        context = _make_context({})
+
+        with patch('handlers.editor.ProductLine.get_by_id') as mock_pl:
+            mock_pl.return_value = MagicMock(id=1, name_fa='قاب موبایل')
+            await load_design_for_edit(update, context, design)
+
+        assert context.user_data['auto_detect'] is True
+        assert context.user_data['stage'] == EditorStage.WORKSPACE
+
+        markup = update.callback_query.message.reply_text.await_args.kwargs['reply_markup']
+        assert "stage_goto_auto" in _callbacks(markup)
 
 
 # ---------------------------------------------------------------------------
@@ -391,163 +485,6 @@ class TestAutoDone:
 
 
 # ---------------------------------------------------------------------------
-# Setting storage
-# ---------------------------------------------------------------------------
-
-class TestBotSettingsStore:
-
-    def _db(self, stored_value):
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (
-            None if stored_value is None else (stored_value,)
-        )
-        conn = MagicMock()
-        conn.cursor.return_value = cursor
-        return conn, cursor
-
-    def test_reads_enabled_flag(self):
-        conn, _ = self._db('1')
-        with patch('models.bot_settings.get_db_connection', return_value=conn):
-            assert BotSettings.is_auto_detect_enabled() is True
-
-    def test_reads_disabled_flag(self):
-        conn, _ = self._db('0')
-        with patch('models.bot_settings.get_db_connection', return_value=conn):
-            assert BotSettings.is_auto_detect_enabled() is False
-
-    def test_defaults_to_off_when_never_set(self):
-        conn, _ = self._db(None)
-        with patch('models.bot_settings.get_db_connection', return_value=conn):
-            assert BotSettings.is_auto_detect_enabled() is False
-
-    def test_defaults_to_off_on_db_error(self):
-        with patch('models.bot_settings.get_db_connection',
-                   side_effect=RuntimeError('db down')):
-            assert BotSettings.is_auto_detect_enabled() is False
-
-    def test_set_writes_flag(self):
-        conn, cursor = self._db(None)
-        with patch('models.bot_settings.get_db_connection', return_value=conn):
-            BotSettings.set_auto_detect_enabled(True)
-            BotSettings.set_auto_detect_enabled(False)
-
-        params = [call.args[1] for call in cursor.execute.call_args_list]
-        assert params == [
-            ('auto_detect_files', '1', '1'),
-            ('auto_detect_files', '0', '0'),
-        ]
-        assert conn.commit.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# Sudo toggle
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-class TestSudoToggle:
-
-    def _update(self, data: str) -> MagicMock:
-        update = MagicMock()
-        update.callback_query = _make_query(data)
-        update.message = None
-        return update
-
-    @patch('models.bot_settings.BotSettings.set_auto_detect_enabled')
-    @patch('handlers.sudo.User.get_by_id')
-    async def test_turns_option_on(self, mock_user, mock_set):
-        mock_user.return_value = _sudo_user()
-        update = self._update("autodetect_on")
-        context = _make_context({})
-
-        await auto_detect_callback(update, context)
-
-        mock_set.assert_called_once_with(True)
-        update.callback_query.edit_message_text.assert_awaited_once()
-
-    @patch('models.bot_settings.BotSettings.set_auto_detect_enabled')
-    @patch('handlers.sudo.User.get_by_id')
-    async def test_turns_option_off(self, mock_user, mock_set):
-        mock_user.return_value = _sudo_user()
-        update = self._update("autodetect_off")
-        context = _make_context({})
-
-        await auto_detect_callback(update, context)
-
-        mock_set.assert_called_once_with(False)
-
-    @patch('models.bot_settings.BotSettings.set_auto_detect_enabled')
-    @patch('handlers.sudo.User.get_by_id')
-    async def test_non_sudo_is_rejected(self, mock_user, mock_set):
-        user = MagicMock()
-        user.is_active = True
-        user.is_sudo = False
-        mock_user.return_value = user
-
-        update = self._update("autodetect_on")
-        context = _make_context({})
-
-        await auto_detect_callback(update, context)
-
-        mock_set.assert_not_called()
-
-    @patch('models.bot_settings.BotSettings.is_auto_detect_enabled')
-    @patch('handlers.sudo.User.get_by_id')
-    async def test_status_panel_shows_toggle_button(self, mock_user, mock_enabled):
-        from handlers.sudo import auto_detect_command
-
-        mock_user.return_value = _sudo_user()
-        mock_enabled.return_value = True
-
-        update = MagicMock()
-        update.message.reply_text = AsyncMock()
-        context = _make_context({})
-
-        await auto_detect_command(update, context)
-
-        markup = update.message.reply_text.await_args.kwargs['reply_markup']
-        assert _callbacks(markup) == {"autodetect_off"}
-
-
-# ---------------------------------------------------------------------------
-# Migration wiring
-# ---------------------------------------------------------------------------
-
-class TestBotSettingsMigration:
-
-    def test_up_creates_bot_settings_table(self):
-        from migrations.migration_010_add_bot_settings import Migration010
-
-        cursor = MagicMock()
-        Migration010.up(cursor)
-
-        sql = cursor.execute.call_args.args[0]
-        assert "CREATE TABLE IF NOT EXISTS bot_settings" in sql
-        assert "setting_key" in sql and "setting_value" in sql
-
-    def test_down_drops_table(self):
-        from migrations.migration_010_add_bot_settings import Migration010
-
-        cursor = MagicMock()
-        Migration010.down(cursor)
-        assert "DROP TABLE IF EXISTS bot_settings" in cursor.execute.call_args.args[0]
-
-    def test_registered_in_migration_list(self):
-        import main
-        from migrations.migration_010_add_bot_settings import Migration010
-
-        assert Migration010.name == "010_add_bot_settings"
-
-        with patch.object(main, 'init_legacy_tables'), \
-             patch.object(main, 'CodeService'), \
-             patch.object(main, 'MigrationManager') as manager_cls:
-            main.run_db_migrations()
-
-        applied = manager_cls.return_value.run_migrations.call_args.args[0]
-        assert any(isinstance(m, Migration010) for m in applied)
-        assert isinstance(applied[-1], Migration010)
-
-
-# ---------------------------------------------------------------------------
 # Callback dispatcher (the wiring registered in main.py)
 # ---------------------------------------------------------------------------
 
@@ -576,9 +513,7 @@ class TestEditorCallbackDispatch:
 
     @patch('handlers.editor.User.get_by_id')
     async def test_auto_done_reaches_confirm_stage(self, mock_user):
-        from handlers.editor import editor_callbacks
-
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=True)
         context = _make_context(self._session())
 
         await editor_callbacks(self._update("stage_auto_done"), context)
@@ -591,9 +526,7 @@ class TestEditorCallbackDispatch:
     async def test_auto_clear_asks_confirmation_then_empties_both_lists(
         self, mock_user
     ):
-        from handlers.editor import editor_callbacks
-
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=True)
         context = _make_context(self._session())
 
         update = self._update("stage_auto_clear")
@@ -609,9 +542,7 @@ class TestEditorCallbackDispatch:
 
     @patch('handlers.editor.User.get_by_id')
     async def test_workspace_add_file_button_opens_auto_stage(self, mock_user):
-        from handlers.editor import editor_callbacks
-
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=True)
         context = _make_context(self._session(stage=EditorStage.WORKSPACE))
 
         await editor_callbacks(self._update("stage_goto_auto"), context)
@@ -621,9 +552,7 @@ class TestEditorCallbackDispatch:
     @patch('handlers.editor.User.get_by_id')
     async def test_legacy_add_buttons_reuse_auto_stage(self, mock_user):
         """Stale keyboards from an auto session must not open a per-type stage."""
-        from handlers.editor import editor_callbacks
-
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=True)
         context = _make_context(self._session(stage=EditorStage.WORKSPACE))
 
         await editor_callbacks(self._update("stage_goto_mockup"), context)
@@ -634,9 +563,7 @@ class TestEditorCallbackDispatch:
 
     @patch('handlers.editor.User.get_by_id')
     async def test_classic_done_buttons_still_work(self, mock_user):
-        from handlers.editor import editor_callbacks
-
-        mock_user.return_value = _sudo_user()
+        mock_user.return_value = _editor_user(auto_detect=False)
         context = _make_context(self._session(
             stage=EditorStage.MOCKUP, auto_detect=False
         ))
@@ -646,3 +573,178 @@ class TestEditorCallbackDispatch:
 
         await editor_callbacks(self._update("stage_print_done"), context)
         assert context.user_data['stage'] == EditorStage.CONFIRM
+
+
+# ---------------------------------------------------------------------------
+# Per-user storage
+# ---------------------------------------------------------------------------
+
+class TestUserAutoDetectFlag:
+
+    def test_default_is_off(self):
+        assert User(user_id=1001).auto_detect_files is False
+
+    def test_reads_flag_from_row(self):
+        assert User(user_id=1001, auto_detect_files=1).auto_detect_files is True
+        assert User(user_id=1001, auto_detect_files=0).auto_detect_files is False
+
+    def test_setter_writes_only_that_user(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        conn.cursor.return_value = cursor
+
+        user = User(user_id=1001)
+        with patch('models.user.get_db_connection', return_value=conn):
+            user.set_auto_detect_enabled(True)
+
+        sql, params = cursor.execute.call_args.args
+        assert "UPDATE users SET auto_detect_files" in sql
+        assert params == (True, 1001)
+        assert conn.commit.call_count == 1
+        assert user.auto_detect_files is True
+
+    def test_setter_rolls_back_on_error(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.execute.side_effect = RuntimeError('db down')
+        conn.cursor.return_value = cursor
+
+        user = User(user_id=1001)
+        with patch('models.user.get_db_connection', return_value=conn):
+            with pytest.raises(RuntimeError):
+                user.set_auto_detect_enabled(True)
+
+        conn.rollback.assert_called_once()
+        assert user.auto_detect_files is False
+
+
+# ---------------------------------------------------------------------------
+# Personal toggle panel
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPersonalToggle:
+
+    def _update(self, data: str) -> MagicMock:
+        update = MagicMock()
+        update.callback_query = _make_query(data)
+        update.message = None
+        return update
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_editor_turns_it_on_for_himself(self, mock_user):
+        user = _editor_user(auto_detect=False)
+        mock_user.return_value = user
+
+        update = self._update("autodetect_on")
+        context = _make_context({})
+
+        await auto_detect_callback(update, context)
+
+        user.set_auto_detect_enabled.assert_called_once_with(True)
+        # The panel now offers to turn it off again
+        markup = update.callback_query.edit_message_text.await_args.kwargs['reply_markup']
+        assert _callbacks(markup) == {"autodetect_off"}
+        assert "🟢 روشن" in update.callback_query.edit_message_text.await_args.args[0]
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_editor_turns_it_off(self, mock_user):
+        user = _editor_user(auto_detect=True)
+        mock_user.return_value = user
+
+        update = self._update("autodetect_off")
+        context = _make_context({})
+
+        await auto_detect_callback(update, context)
+
+        user.set_auto_detect_enabled.assert_called_once_with(False)
+        assert user.auto_detect_files is False
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_status_panel_shows_toggle_button(self, mock_user):
+        mock_user.return_value = _editor_user(auto_detect=True)
+
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        context = _make_context({})
+
+        await auto_detect_command(update, context)
+
+        markup = update.message.reply_text.await_args.kwargs['reply_markup']
+        assert _callbacks(markup) == {"autodetect_off"}
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_non_editor_cannot_toggle(self, mock_user):
+        reviewer = MagicMock()
+        reviewer.is_active = True
+        reviewer.is_sudo = False
+        reviewer.get_effective_role.return_value = 'reviewer'
+        mock_user.return_value = reviewer
+
+        update = self._update("autodetect_on")
+        context = _make_context({})
+
+        await auto_detect_callback(update, context)
+
+        update.callback_query.edit_message_text.assert_not_awaited()
+
+    @patch('handlers.editor.User.get_by_id')
+    async def test_save_failure_is_reported(self, mock_user):
+        user = _editor_user(auto_detect=False)
+        user.set_auto_detect_enabled = MagicMock(side_effect=RuntimeError('db down'))
+        mock_user.return_value = user
+
+        update = self._update("autodetect_on")
+        context = _make_context({})
+
+        await auto_detect_callback(update, context)
+
+        # The last answer is the error toast
+        assert "ناموفق" in update.callback_query.answer.await_args.kwargs['text']
+
+
+# ---------------------------------------------------------------------------
+# Migration wiring
+# ---------------------------------------------------------------------------
+
+class TestAutoDetectMigration:
+
+    def test_up_adds_users_column(self):
+        from migrations.migration_010_add_auto_detect_to_users import Migration010
+
+        cursor = MagicMock()
+        Migration010.up(cursor)
+
+        sql = cursor.execute.call_args.args[0]
+        assert "ALTER TABLE users" in sql
+        assert "auto_detect_files BOOLEAN NOT NULL DEFAULT FALSE" in sql
+
+    def test_up_is_idempotent_on_duplicate_column(self):
+        from migrations.migration_010_add_auto_detect_to_users import Migration010
+
+        cursor = MagicMock()
+        cursor.execute.side_effect = Exception("Duplicate column name 'auto_detect_files'")
+        Migration010.up(cursor)  # must not raise
+
+    def test_down_drops_column(self):
+        from migrations.migration_010_add_auto_detect_to_users import Migration010
+
+        cursor = MagicMock()
+        Migration010.down(cursor)
+        sql = cursor.execute.call_args.args[0]
+        assert "DROP COLUMN IF EXISTS auto_detect_files" in sql
+
+    def test_registered_in_migration_list(self):
+        import main
+        from migrations.migration_010_add_auto_detect_to_users import Migration010
+
+        assert Migration010.name == "010_add_auto_detect_to_users"
+
+        with patch.object(main, 'init_legacy_tables'), \
+             patch.object(main, 'CodeService'), \
+             patch.object(main, 'MigrationManager') as manager_cls:
+            main.run_db_migrations()
+
+        applied = manager_cls.return_value.run_migrations.call_args.args[0]
+        assert any(isinstance(m, Migration010) for m in applied)
+        assert isinstance(applied[-1], Migration010)

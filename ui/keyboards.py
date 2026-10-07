@@ -30,6 +30,9 @@ class Keyboards:
             # Reset stats for editors
             keyboard.append([KeyboardButton("🔄 بازنشانی آمار")])
 
+            # Personal auto-detect option (mockup vs print)
+            keyboard.append([KeyboardButton("🤖 تشخیص خودکار")])
+
         # Per-line stats — everyone
         row = []
         for pl in product_lines:
@@ -67,9 +70,6 @@ class Keyboards:
             keyboard.append([
                 KeyboardButton("🔄 ریستارت"),
                 KeyboardButton("⚙️ تنظیم گروه‌ها")
-            ])
-            keyboard.append([
-                KeyboardButton("🤖 تشخیص خودکار")
             ])
             keyboard.append([
                 KeyboardButton("📊 وضعیت"),

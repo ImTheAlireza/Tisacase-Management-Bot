@@ -57,7 +57,8 @@ def _create_test_schema(cursor) -> None:
             added_by BIGINT,
             added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_active DATETIME,
-            metadata JSON
+            metadata JSON,
+            auto_detect_files BOOLEAN DEFAULT FALSE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """)
 

@@ -32,7 +32,7 @@ from migrations.migration_006_create_design_group_messages import Migration006
 from migrations.migration_007_add_deleted_status import Migration007
 from migrations.migration_008_add_stats_reset import Migration008
 from migrations.migration_009_add_file_types import Migration009
-from migrations.migration_010_add_bot_settings import Migration010
+from migrations.migration_010_add_auto_detect_to_users import Migration010
 
 # Handlers
 from handlers.common import start_command, cancel_command
@@ -43,12 +43,14 @@ from handlers.sudo import (
     handle_group_id_input, status_command, broadcast_update_callback,
     delete_design_command, confirm_delete_design_callback,
     cleanup_orphans_command, confirm_restore_callback,
-    backup_type_callback, csv_range_callback,
-    auto_detect_command, auto_detect_callback
+    backup_type_callback, csv_range_callback
 )
 from handlers.reset_stats import reset_stats_command, reset_stats_callback
 from handlers.stats import stats_command, stats_callback
-from handlers.editor import start_new_design, handle_files, editor_callbacks
+from handlers.editor import (
+    start_new_design, handle_files, editor_callbacks,
+    auto_detect_command, auto_detect_callback
+)
 from handlers.reviewer import review_callback, handle_reject_reason_reply
 from handlers.help import help_command, help_callback
 from handlers.search import (
@@ -520,7 +522,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("deletedesign",  delete_design_command))
     application.add_handler(CommandHandler("cleanup",       cleanup_orphans_command))
 
-    # Auto detection of mockup vs print files (sudo)
+    # Auto detection of mockup vs print files (personal editor option)
     application.add_handler(CommandHandler("autodetect",    auto_detect_command))
 
     # -----------------------------------------------------------------------
@@ -570,7 +572,7 @@ if __name__ == "__main__":
         pattern=r"^setgroup_"
     ))
 
-    # Auto detection toggle (sudo)
+    # Auto detection toggle (personal editor option)
     application.add_handler(CallbackQueryHandler(
         auto_detect_callback,
         pattern=r"^(autodetect_on|autodetect_off)$"
