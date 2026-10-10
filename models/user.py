@@ -23,6 +23,7 @@ class User:
         last_active=None,
         metadata=None,
         stats_reset_at=None,
+        auto_detect_files: bool = False,
         **kwargs
     ):
         self.user_id = user_id
@@ -38,6 +39,8 @@ class User:
         self.last_active = last_active
         self.metadata = metadata
         self.stats_reset_at = stats_reset_at
+        # Per-editor option: auto detect mockup (photo) vs print (document)
+        self.auto_detect_files = bool(auto_detect_files)
 
         if kwargs:
             logging.warning(f"User.__init__ received unknown kwargs: {list(kwargs.keys())}")
@@ -139,6 +142,32 @@ class User:
             conn.commit()
             self.active_role = new_role
             logging.info(f"User {self.user_id} switched to role: {new_role}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def set_auto_detect_enabled(self, enabled: bool) -> None:
+        """
+        Turn auto detection of mockup vs print files on/off for this user.
+        Personal option — never affects other editors.
+        """
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE users SET auto_detect_files = %s WHERE user_id = %s",
+                (bool(enabled), self.user_id)
+            )
+            conn.commit()
+            self.auto_detect_files = bool(enabled)
+            logging.info(
+                f"🤖 User {self.user_id}: auto detect files "
+                f"{'enabled' if enabled else 'disabled'}"
+            )
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to update auto_detect_files for {self.user_id}: {e}")
+            raise
         finally:
             cursor.close()
             conn.close()

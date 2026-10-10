@@ -21,6 +21,7 @@ class StateManager:
         'workspace_message_id',
         'inactivity_job',
         'editing_existing',
+        'auto_detect',
     ]
 
     # Sudo/admin workflow state keys

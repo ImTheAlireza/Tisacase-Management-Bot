@@ -30,6 +30,9 @@ class Keyboards:
             # Reset stats for editors
             keyboard.append([KeyboardButton("🔄 بازنشانی آمار")])
 
+            # Personal auto-detect option (mockup vs print)
+            keyboard.append([KeyboardButton("🤖 تشخیص خودکار")])
+
         # Per-line stats — everyone
         row = []
         for pl in product_lines:
@@ -162,6 +165,45 @@ class Keyboards:
 
         return text, InlineKeyboardMarkup(buttons)
 
+    @staticmethod
+    def get_auto_stage(
+        code: str,
+        product_name: str,
+        mockup_count: int,
+        print_count: int,
+        is_edit: bool = False
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        """Auto detect stage: photos → mockups, documents → print files"""
+
+        text = (
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📦 *{code}* | {product_name}\n"
+            f"🤖 تشخیص خودکار فعال است\n\n"
+            f"🎨 موکاپ: {mockup_count} فایل\n"
+            f"🖨 فایل چاپی: {print_count} فایل\n\n"
+            f"⬇️ فایل‌ها را ارسال کنید\n"
+            f"📷 عکس معمولی → موکاپ\n"
+            f"📎 فایل (Document) → چاپی\n"
+            f"━━━━━━━━━━━━━━━━"
+        )
+
+        buttons = [
+            [InlineKeyboardButton(
+                "✅ اتمام ارسال",
+                callback_data="stage_auto_done"
+            )],
+            [InlineKeyboardButton(
+                "🗑 پاکسازی لیست و ارسال دوباره",
+                callback_data="stage_auto_clear"
+            )],
+            [InlineKeyboardButton(
+                "❌ لغو ویرایش" if is_edit else "❌ لغو طرح",
+                callback_data="cancel_editing" if is_edit else "cancel_submission"
+            )],
+        ]
+
+        return text, InlineKeyboardMarkup(buttons)
+
 
     @staticmethod
     def get_workspace_stage(
@@ -169,7 +211,8 @@ class Keyboards:
         product_name: str,
         mockup_count: int,
         print_count: int,
-        is_edit: bool = False
+        is_edit: bool = False,
+        auto_detect: bool = False
     ) -> tuple[str, InlineKeyboardMarkup]:
         """Workspace: editing hub between stages"""
 
@@ -189,21 +232,31 @@ class Keyboards:
             f"📦 *{code}* | {product_name}\n\n"
             f"{mockup_line}\n"
             f"{print_line}\n"
+            + ("🤖 تشخیص خودکار: فعال\n" if auto_detect else "") +
             f"━━━━━━━━━━━━━━━━"
         )
 
-        buttons = [
-            [
+        if auto_detect:
+            # One upload screen — files are sorted by their own type
+            buttons = [[
                 InlineKeyboardButton(
-                    "🎨 افزودن موکاپ +",
-                    callback_data="stage_goto_mockup"
+                    "➕ افزودن فایل",
+                    callback_data="stage_goto_auto"
                 ),
-                InlineKeyboardButton(
-                    "🖨 افزودن فایل چاپی +",
-                    callback_data="stage_goto_print"
-                ),
-            ],
-        ]
+            ]]
+        else:
+            buttons = [
+                [
+                    InlineKeyboardButton(
+                        "🎨 افزودن موکاپ +",
+                        callback_data="stage_goto_mockup"
+                    ),
+                    InlineKeyboardButton(
+                        "🖨 افزودن فایل چاپی +",
+                        callback_data="stage_goto_print"
+                    ),
+                ],
+            ]
 
         # Management buttons — only show if files exist
         manage_row = []
@@ -283,7 +336,12 @@ class Keyboards:
     def get_clear_confirmation(stage: str) -> tuple[str, InlineKeyboardMarkup]:
         """Confirmation dialog before clearing file list"""
 
-        stage_label = "موکاپ‌ها" if stage == "mockup" else "فایل‌های چاپی"
+        if stage == "mockup":
+            stage_label = "موکاپ‌ها"
+        elif stage == "print":
+            stage_label = "فایل‌های چاپی"
+        else:
+            stage_label = "فایل‌ها"
 
         text = (
             f"⚠️ آیا مطمئن هستید؟\n"

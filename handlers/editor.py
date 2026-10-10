@@ -126,6 +126,7 @@ def _get_stage_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
         'print_files':          context.user_data.get('print_files', []),
         'workspace_message_id': context.user_data.get('workspace_message_id'),
         'editing_existing':     context.user_data.get('editing_existing', False),
+        'auto_detect':          context.user_data.get('auto_detect', False),
     }
 
 
@@ -157,6 +158,7 @@ async def _render_stage(
     stage        = state['stage']
     msg_id       = state['workspace_message_id']
     is_edit      = state['editing_existing']
+    auto_detect  = state['auto_detect']
 
     # Build text + markup based on stage
     if stage == EditorStage.MOCKUP:
@@ -165,8 +167,11 @@ async def _render_stage(
     elif stage == EditorStage.PRINT:
         text, markup = Keyboards.get_print_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
 
+    elif stage == EditorStage.AUTO:
+        text, markup = Keyboards.get_auto_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
+
     elif stage == EditorStage.WORKSPACE:
-        text, markup = Keyboards.get_workspace_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
+        text, markup = Keyboards.get_workspace_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit, auto_detect=auto_detect)
 
     elif stage == EditorStage.CONFIRM:
         text, markup = Keyboards.get_confirm_stage(code, product_name, len(mockups), len(prints), is_edit=is_edit)
@@ -236,6 +241,11 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['print_files'] = design.print_file_ids.copy()
     context.user_data['file_types'] = design.file_types.copy()
     context.user_data['editing_existing'] = True  # Flag to indicate edit mode
+    # Snapshot this editor's personal auto-detect option for the session
+    editor_user = User.get_by_id(user_id)
+    context.user_data['auto_detect'] = bool(
+        editor_user and editor_user.auto_detect_files
+    )
 
     # Send workspace message
     text, markup = Keyboards.get_workspace_stage(
@@ -243,7 +253,8 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         product_line.name_fa,
         len(design.mockup_file_ids),
         len(design.print_file_ids),
-        is_edit=True
+        is_edit=True,
+        auto_detect=context.user_data['auto_detect']
     )
 
     try:
@@ -279,7 +290,8 @@ async def start_new_design(
 ) -> None:
     """
     Entry point when editor taps a product line button.
-    Generates code, enters mockup stage immediately.
+    Generates code, enters mockup stage immediately
+    (or the auto-detect stage when the editor enabled it for themselves).
     """
     user = context.user_data['db_user']
     user_id = user.user_id
@@ -340,17 +352,25 @@ async def start_new_design(
 
     product = ProductLine.get_by_id(design.product_line_id)
 
-    # Set initial state — enter mockup stage directly
+    # Snapshot this editor's personal auto-detect option for the session
+    auto_detect = bool(user.auto_detect_files)
+
+    # Set initial state — enter mockup stage directly,
+    # or the single auto-detect stage when the editor enabled it
     context.user_data['code']         = code
     context.user_data['product_id']   = product.id
     context.user_data['product_name'] = product.name_fa
-    context.user_data['stage']        = EditorStage.MOCKUP
+    context.user_data['stage']        = EditorStage.AUTO if auto_detect else EditorStage.MOCKUP
     context.user_data['mockup_files'] = []
     context.user_data['print_files']  = []
     context.user_data['editing_existing'] = False
+    context.user_data['auto_detect'] = auto_detect
 
     # Send workspace message
-    text, markup = Keyboards.get_mockup_stage(code, product.name_fa, 0)
+    if auto_detect:
+        text, markup = Keyboards.get_auto_stage(code, product.name_fa, 0, 0)
+    else:
+        text, markup = Keyboards.get_mockup_stage(code, product.name_fa, 0)
     msg = await update.message.reply_text(
         text,
         reply_markup=markup,
@@ -360,6 +380,68 @@ async def start_new_design(
 
     # Start inactivity timer
     _reset_inactivity_timer(context, update.effective_chat.id)
+
+# ---------------------------------------------------------------------------
+# Personal Option — Auto Detect Mockup vs Print Files
+# ---------------------------------------------------------------------------
+
+def _auto_detect_panel(enabled: bool) -> Tuple[str, InlineKeyboardMarkup]:
+    """Text + toggle button for the editor's personal auto-detect option."""
+    text = (
+        "🤖 تشخیص خودکار موکاپ و چاپی\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        f"وضعیت شما: {'🟢 روشن' if enabled else '🔴 خاموش'}\n\n"
+        "در حالت روشن:\n"
+        "• دکمه‌های «اتمام ثبت موکاپ» و «اتمام ثبت فایل چاپی» نمایش داده نمی‌شوند\n"
+        "• مستقیم دکمه «✅ اتمام ارسال» را می‌بینید\n"
+        "• 📷 عکس معمولی → موکاپ\n"
+        "• 📎 فایل (Document) → چاپی\n\n"
+        "⚠️ این تنظیم فقط برای خودتان است و از ثبت بعدی اعمال می‌شود."
+    )
+
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔴 خاموش کردن" if enabled else "🟢 روشن کردن",
+            callback_data="autodetect_off" if enabled else "autodetect_on"
+        )
+    ]])
+
+    return text, markup
+
+
+@require_role('editor')
+async def auto_detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the editor's personal auto-detect status with a toggle button."""
+    user: User = context.user_data['db_user']
+    enabled = bool(user.auto_detect_files)
+
+    text, markup = _auto_detect_panel(enabled)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+@require_role('editor')
+async def auto_detect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle auto detection for the editor who pressed the button — nobody else."""
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    user: User = context.user_data['db_user']
+    enable: bool = query.data == "autodetect_on"
+
+    try:
+        user.set_auto_detect_enabled(enable)
+    except Exception as e:
+        logging.error(f"Failed to toggle auto detect for {user.user_id}: {e}")
+        await safe_answer_callback(query, "❌ ذخیره تنظیم ناموفق بود", show_alert=True)
+        return
+
+    # An already running session keeps its flow — applies from the next design
+    text, markup = _auto_detect_panel(bool(user.auto_detect_files))
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except Exception as e:
+        logging.warning(f"Could not update auto-detect message: {e}")
+
 
 # ---------------------------------------------------------------------------
 # File Handler — Stage Aware
@@ -373,6 +455,7 @@ async def handle_files(
     """
     Receives files from editor.
     Stage-aware: mockup stage → goes to mockup_files, print stage → print_files.
+    Auto-detect sessions: photo → mockup_files, document → print_files.
     Also handles restore ZIP file upload.
     """
     # ── Check for restore file upload ────────────────────────────────
@@ -383,7 +466,7 @@ async def handle_files(
     stage: Optional[EditorStage] = context.user_data.get('stage')
 
     # Only accept files during active upload stages
-    if stage not in (EditorStage.MOCKUP, EditorStage.PRINT):
+    if stage not in (EditorStage.MOCKUP, EditorStage.PRINT, EditorStage.AUTO):
         return
 
     code: Optional[str] = context.user_data.get('code')
@@ -429,13 +512,22 @@ async def handle_files(
     # Store file type mapping
     context.user_data.setdefault('file_types', {})[file_id] = file_type
 
+    # Auto detection: a normal photo is a mockup, anything sent as a
+    # document is a print file — no stage buttons involved.
+    if context.user_data.get('auto_detect') or stage == EditorStage.AUTO:
+        bucket = 'mockup' if file_type == 'photo' else 'print'
+    elif stage == EditorStage.MOCKUP:
+        bucket = 'mockup'
+    else:
+        bucket = 'print'
+
     # Add to correct list
-    if stage == EditorStage.MOCKUP:
+    if bucket == 'mockup':
         context.user_data.setdefault('mockup_files', []).append(file_id)
         count = len(context.user_data['mockup_files'])
         await update.message.reply_text(f"✅ موکاپ {count} دریافت شد.")
 
-    elif stage == EditorStage.PRINT:
+    else:
         context.user_data.setdefault('print_files', []).append(file_id)
         count = len(context.user_data['print_files'])
         await update.message.reply_text(f"✅ فایل چاپی {count} دریافت شد.")
@@ -485,12 +577,26 @@ async def editor_callbacks(
     elif data == "stage_print_done":
         await _handle_print_done(query, context, chat_id)
 
+    elif data == "stage_auto_done":
+        await _handle_auto_done(query, context, chat_id)
+
     elif data == "stage_goto_mockup":
-        context.user_data['stage'] = EditorStage.MOCKUP
+        # Auto-detect sessions have a single upload screen for both types
+        context.user_data['stage'] = (
+            EditorStage.AUTO if context.user_data.get('auto_detect')
+            else EditorStage.MOCKUP
+        )
         await _render_stage(context, chat_id)
 
     elif data == "stage_goto_print":
-        context.user_data['stage'] = EditorStage.PRINT
+        context.user_data['stage'] = (
+            EditorStage.AUTO if context.user_data.get('auto_detect')
+            else EditorStage.PRINT
+        )
+        await _render_stage(context, chat_id)
+
+    elif data == "stage_goto_auto":
+        context.user_data['stage'] = EditorStage.AUTO
         await _render_stage(context, chat_id)
 
     elif data == "back_to_workspace":
@@ -507,6 +613,9 @@ async def editor_callbacks(
     elif data == "stage_print_clear":
         await _handle_clear_request(query, context, chat_id, stage="print")
 
+    elif data == "stage_auto_clear":
+        await _handle_clear_request(query, context, chat_id, stage="auto")
+
     elif data == "clear_confirmed_mockup":
         context.user_data['mockup_files'] = []
         context.user_data['stage'] = EditorStage.MOCKUP
@@ -517,7 +626,14 @@ async def editor_callbacks(
         context.user_data['stage'] = EditorStage.PRINT
         await _render_stage(context, chat_id)
 
-    elif data in ("clear_cancelled_mockup", "clear_cancelled_print"):
+    elif data == "clear_confirmed_auto":
+        # Auto-detect sessions keep both lists in one screen
+        context.user_data['mockup_files'] = []
+        context.user_data['print_files'] = []
+        context.user_data['stage'] = EditorStage.AUTO
+        await _render_stage(context, chat_id)
+
+    elif data in ("clear_cancelled_mockup", "clear_cancelled_print", "clear_cancelled_auto"):
         # Just re-render current stage
         await _render_stage(context, chat_id)
 
@@ -602,6 +718,35 @@ async def _handle_print_done(query, context, chat_id: int) -> None:
     if not prints:
         await safe_answer_callback(query, "❌ حداقل یک فایل چاپی باید ارسال شود",
             show_alert=True)
+        return
+
+    # Move to confirm stage
+    context.user_data['stage'] = EditorStage.CONFIRM
+    await _render_stage(context, chat_id)
+
+
+async def _handle_auto_done(query, context, chat_id: int) -> None:
+    """
+    User pressed 'اتمام ارسال' — the single finish button shown when
+    Sudo enabled auto detection of mockup vs print files.
+    """
+    mockups = context.user_data.get('mockup_files', [])
+    prints  = context.user_data.get('print_files', [])
+
+    if not mockups:
+        await safe_answer_callback(
+            query,
+            "❌ حداقل یک موکاپ باید ارسال شود\n📷 عکس را به صورت عکس معمولی بفرستید",
+            show_alert=True
+        )
+        return
+
+    if not prints:
+        await safe_answer_callback(
+            query,
+            "❌ حداقل یک فایل چاپی باید ارسال شود\n📎 فایل را به صورت فایل (Document) بفرستید",
+            show_alert=True
+        )
         return
 
     # Move to confirm stage
