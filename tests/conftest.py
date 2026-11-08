@@ -87,7 +87,7 @@ def _create_test_schema(cursor) -> None:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS designs (
             id INT AUTO_INCREMENT PRIMARY KEY,
-            code VARCHAR(20) UNIQUE NOT NULL,
+            code VARCHAR(40) UNIQUE NOT NULL,
             product_line_id INT NOT NULL,
             status ENUM('pending', 'approved', 'rejected', 'deleted') DEFAULT 'pending',
             editor_user_id BIGINT NOT NULL,
@@ -96,6 +96,8 @@ def _create_test_schema(cursor) -> None:
             reviewer_name VARCHAR(255),
             mockup_file_ids JSON NOT NULL,
             print_file_ids JSON NOT NULL,
+            file_types JSON DEFAULT NULL,
+            print_file_metadata JSON DEFAULT NULL,
             mockup_message_ids_reviewer JSON,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             reviewed_at DATETIME,

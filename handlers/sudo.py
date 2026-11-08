@@ -13,6 +13,7 @@ from utils.helpers import get_tehran_time, send_with_retry, safe_answer_callback
 from config.settings import SUDO_USER_ID, SUPERVISORD_CONF, SUPERVISOR_PROCESS, TELEGRAM_UPLOAD_LIMIT_BYTES
 from utils.enums import DesignStatus
 from utils.callback_lock import deduplicate_callback
+from utils.state_manager import StateManager
 
 
 def _verify_sudo_for_group_input(user_id):
@@ -211,6 +212,8 @@ async def csv_range_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 @require_sudo
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask user to send the backup ZIP file for restore"""
+    # A backup ZIP must never be mistaken for a forwarded print document.
+    StateManager.clear_print_recovery_state(context)
     context.user_data['awaiting_restore_file'] = True
     await update.message.reply_text(
         "🔧 ریستور از بکاپ\n"

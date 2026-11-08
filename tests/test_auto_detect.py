@@ -747,4 +747,4 @@ class TestAutoDetectMigration:
 
         applied = manager_cls.return_value.run_migrations.call_args.args[0]
         assert any(isinstance(m, Migration010) for m in applied)
-        assert isinstance(applied[-1], Migration010)
+        assert [m.name for m in applied] == sorted(m.name for m in applied)

@@ -33,6 +33,8 @@ from migrations.migration_007_add_deleted_status import Migration007
 from migrations.migration_008_add_stats_reset import Migration008
 from migrations.migration_009_add_file_types import Migration009
 from migrations.migration_010_add_auto_detect_to_users import Migration010
+from migrations.migration_011_add_print_file_metadata import Migration011
+from migrations.migration_012_expand_design_code import Migration012
 
 # Handlers
 from handlers.common import start_command, cancel_command
@@ -52,6 +54,10 @@ from handlers.editor import (
     auto_detect_command, auto_detect_callback
 )
 from handlers.reviewer import review_callback, handle_reject_reason_reply
+from handlers.print_recovery import (
+    resend_print_command, resend_print_callback,
+    repair_print_command, handle_print_repair_file
+)
 from handlers.help import help_command, help_callback
 from handlers.search import (
     search_command, search_filter_callback, search_back_callback,
@@ -154,18 +160,25 @@ def run_db_migrations():
         Migration001(), Migration002(), Migration003(),
         Migration004(), Migration005(), Migration006(),
         Migration007(), Migration008(), Migration009(),
-        Migration010()
+        Migration010(), Migration011(), Migration012()
     ]
     manager = MigrationManager()
-    manager.run_migrations(migrations)
+    if not manager.run_migrations(migrations):
+        raise RuntimeError("Database migrations failed; bot startup aborted.")
     CodeService.cleanup_orphaned_designs()
+
+
+async def route_uploaded_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await handle_print_repair_file(update, context):
+        return
+    await handle_files(update, context)
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     # -----------------------------------------------------------------------
-    # Priority 0 — awaiting reject reason reply
+    # Priority 0 — replies to legacy reject-reason prompts
     # -----------------------------------------------------------------------
     if await handle_reject_reason_reply(update, context):
         return
@@ -519,6 +532,8 @@ if __name__ == "__main__":
 
     # Design management
     application.add_handler(CommandHandler("designinfo",    design_info_command))
+    application.add_handler(CommandHandler("resendprint",   resend_print_command))
+    application.add_handler(CommandHandler("repairprint",   repair_print_command))
     application.add_handler(CommandHandler("deletedesign",  delete_design_command))
     application.add_handler(CommandHandler("cleanup",       cleanup_orphans_command))
 
@@ -534,7 +549,7 @@ if __name__ == "__main__":
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.ALL),
-            handle_files
+            route_uploaded_file
         )
     )
 
@@ -558,6 +573,12 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(
         review_callback,
         pattern=r"^(approve|reject)_"
+    ))
+
+    # Sudo-only, confirmed retry of one approved print file
+    application.add_handler(CallbackQueryHandler(
+        resend_print_callback,
+        pattern=r"^resendprint_(confirm|cancel)$"
     ))
 
     # Restart

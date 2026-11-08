@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+from copy import deepcopy
 from typing import Optional, Tuple
 from telegram import (
     Update,
@@ -227,6 +228,10 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
             show_alert=True)
         return
 
+    # A file intended for a new editor session must not be intercepted by a
+    # stale Sudo repair flow (or confirm an older recovery afterwards).
+    StateManager.clear_print_recovery_state(context)
+
     # Cleanup any existing session
     _clear_editor_state(context)
 
@@ -240,6 +245,7 @@ async def load_design_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['mockup_files'] = design.mockup_file_ids.copy()
     context.user_data['print_files'] = design.print_file_ids.copy()
     context.user_data['file_types'] = design.file_types.copy()
+    context.user_data['print_file_metadata'] = deepcopy(design.print_file_metadata)
     context.user_data['editing_existing'] = True  # Flag to indicate edit mode
     # Snapshot this editor's personal auto-detect option for the session
     editor_user = User.get_by_id(user_id)
@@ -295,6 +301,7 @@ async def start_new_design(
     """
     user = context.user_data['db_user']
     user_id = user.user_id
+    StateManager.clear_print_recovery_state(context)
 
     # ========== CLEANUP EXISTING SESSION ==========
     old_code = context.user_data.get('code')
@@ -363,6 +370,7 @@ async def start_new_design(
     context.user_data['stage']        = EditorStage.AUTO if auto_detect else EditorStage.MOCKUP
     context.user_data['mockup_files'] = []
     context.user_data['print_files']  = []
+    context.user_data['print_file_metadata'] = {}
     context.user_data['editing_existing'] = False
     context.user_data['auto_detect'] = auto_detect
 
@@ -528,9 +536,26 @@ async def handle_files(
         await update.message.reply_text(f"✅ موکاپ {count} دریافت شد.")
 
     else:
+        # getFile only provides a download path, not necessarily the original
+        # filename. Capture the document metadata while the upload is available.
+        if file_type == 'document':
+            file_name = update.message.document.file_name
+            mime_type = update.message.document.mime_type
+            metadata = {
+                'file_name': file_name if isinstance(file_name, str) else None,
+                'mime_type': mime_type if isinstance(mime_type, str) else None,
+            }
+        else:
+            # Telegram photo uploads are JPEGs, even if the source wasn't.
+            metadata = {'file_name': None, 'mime_type': 'image/jpeg'}
+        context.user_data.setdefault('print_file_metadata', {})[file_id] = metadata
         context.user_data.setdefault('print_files', []).append(file_id)
         count = len(context.user_data['print_files'])
-        await update.message.reply_text(f"✅ فایل چاپی {count} دریافت شد.")
+        response = f"✅ فایل چاپی {count} دریافت شد."
+        if file_type == 'photo':
+            response += ("\n⚠️ عکس تلگرام ممکن است فشرده شده باشد؛ "
+                         "برای حفظ کیفیت چاپ، نسخه اصلی را به‌صورت فایل ارسال کنید.")
+        await update.message.reply_text(response)
 
     # Reset inactivity timer on every file
     _reset_inactivity_timer(context, update.effective_chat.id)
@@ -623,6 +648,7 @@ async def editor_callbacks(
 
     elif data == "clear_confirmed_print":
         context.user_data['print_files'] = []
+        context.user_data['print_file_metadata'] = {}
         context.user_data['stage'] = EditorStage.PRINT
         await _render_stage(context, chat_id)
 
@@ -630,6 +656,7 @@ async def editor_callbacks(
         # Auto-detect sessions keep both lists in one screen
         context.user_data['mockup_files'] = []
         context.user_data['print_files'] = []
+        context.user_data['print_file_metadata'] = {}
         context.user_data['stage'] = EditorStage.AUTO
         await _render_stage(context, chat_id)
 
@@ -685,6 +712,7 @@ async def editor_callbacks(
 
     elif data == "manage_clear_print":
         context.user_data['print_files'] = []
+        context.user_data['print_file_metadata'] = {}
         context.user_data['stage'] = EditorStage.WORKSPACE
         await _render_stage(context, chat_id)
 
@@ -813,10 +841,13 @@ async def _handle_remove_file(query, context, chat_id: int, stage: str, index: i
     removed = files.pop(index)
     context.user_data[files_key] = files
 
-    # Also remove from file_types if present
-    file_types = context.user_data.get('file_types', {})
-    file_types.pop(removed, None)
-    context.user_data['file_types'] = file_types
+    if stage == 'print' and removed not in files:
+        context.user_data.get('print_file_metadata', {}).pop(removed, None)
+
+    # The same Telegram file can occur more than once or in both buckets.
+    if (removed not in context.user_data.get('mockup_files', [])
+            and removed not in context.user_data.get('print_files', [])):
+        context.user_data.get('file_types', {}).pop(removed, None)
 
     # Re-render the management view
     code = context.user_data.get('code', '')
@@ -1090,6 +1121,10 @@ async def _handle_submit_to_reviewer(
     design.mockup_file_ids = mockups
     design.print_file_ids  = prints
     design.file_types = file_types
+    metadata = context.user_data.get('print_file_metadata', {})
+    design.print_file_metadata = {
+        fid: deepcopy(metadata[fid]) for fid in prints if fid in metadata
+    }
 
     try:
         design.save()
