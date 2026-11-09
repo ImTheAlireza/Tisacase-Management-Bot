@@ -17,6 +17,7 @@ class StateManager:
         'stage',
         'mockup_files',
         'print_files',
+        'print_file_metadata',
         'file_types',
         'workspace_message_id',
         'inactivity_job',
@@ -31,6 +32,8 @@ class StateManager:
         'restore_pending',
         'selected_group_type',
         'selected_line_id',
+        'pending_print_resend',
+        'awaiting_print_repair_file',
     ]
 
     # Design management state keys
@@ -60,6 +63,13 @@ class StateManager:
         for key in StateManager.EDITOR_KEYS:
             user_data.pop(key, None)
         logging.debug("Editor state cleared")
+
+    @staticmethod
+    def clear_print_recovery_state(context_or_dict) -> None:
+        """Cancel recovery before starting a separate editor session."""
+        user_data = context_or_dict.user_data if hasattr(context_or_dict, 'user_data') else context_or_dict
+        user_data.pop('pending_print_resend', None)
+        user_data.pop('awaiting_print_repair_file', None)
 
     @staticmethod
     def clear_sudo_state(context_or_dict) -> None:

@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 import asyncio
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaDocument
 from telegram.ext import ContextTypes
@@ -479,6 +480,7 @@ async def _handle_resubmit(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     new_design.mockup_file_ids = design.mockup_file_ids.copy()
     new_design.print_file_ids = design.print_file_ids.copy()
     new_design.file_types = design.file_types.copy() if design.file_types else {}
+    new_design.print_file_metadata = deepcopy(design.print_file_metadata)
     new_design.save()
 
     # Load into editor

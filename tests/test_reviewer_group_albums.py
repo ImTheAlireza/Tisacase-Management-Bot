@@ -6,13 +6,14 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 from telegram import InputMediaPhoto, InputMediaDocument
+from telegram.error import BadRequest
 from models.design import Design
 from handlers.reviewer import (
     MAX_MEDIA_GROUP_ITEMS,
     _send_mockups_to_products_group,
     _send_prints_to_print_group,
 )
-from config.settings import MAX_FILE_SIZE_DOWNLOAD_MB
+from config.settings import MAX_FILE_SIZE_DOWNLOAD_MB, SUDO_USER_ID
 
 
 PRODUCTS_CHAT_ID = -100111
@@ -25,7 +26,7 @@ def no_send_pacing(monkeypatch):
     monkeypatch.setattr('utils.helpers.TELEGRAM_SEND_DELAY', 0)
 
 
-def _make_design(mockups=None, prints=None, file_types=None) -> Design:
+def _make_design(mockups=None, prints=None, file_types=None, print_extension=None) -> Design:
     return Design(
         id=1,
         code='TS001',
@@ -33,6 +34,10 @@ def _make_design(mockups=None, prints=None, file_types=None) -> Design:
         mockup_file_ids=mockups or [],
         print_file_ids=prints or [],
         file_types=file_types or {},
+        print_file_metadata={
+            fid: {'file_name': f'original.{print_extension}', 'mime_type': None}
+            for fid in (prints or []) if print_extension
+        },
     )
 
 
@@ -44,8 +49,11 @@ def _make_product_line() -> MagicMock:
     return pl
 
 
-def _make_file(file_path='files/photo.png', file_size=1024, data=b'filedata'):
-    """Fake telegram File object."""
+def _make_file(file_path='files/photo.png', file_size=1024, data=None):
+    """Fake Telegram File with a matching byte count unless specified."""
+    if data is None:
+        # Oversized fixtures are never downloaded; don't allocate huge buffers.
+        data = b'x' * file_size if file_size and file_size <= 1024 * 1024 else b''
     file = MagicMock()
     file.file_path = file_path
     file.file_size = file_size
@@ -53,12 +61,16 @@ def _make_file(file_path='files/photo.png', file_size=1024, data=b'filedata'):
     return file
 
 
-def _make_bot(files=None, media_group_error=None):
+def _make_bot(files=None, media_group_error=None, probe_name=None, probe_size=None):
     bot = MagicMock()
     bot._next_id = 100
 
     def _next_message(*args, **kwargs):
         bot._next_id += 1
+        if kwargs.get('chat_id') == SUDO_USER_ID:
+            return MagicMock(message_id=bot._next_id, document=MagicMock(
+                file_name=probe_name, file_size=probe_size, file_unique_id=None
+            ))
         return MagicMock(message_id=bot._next_id)
 
     async def _send_media_group(chat_id, media):
@@ -72,6 +84,7 @@ def _make_bot(files=None, media_group_error=None):
 
     bot.send_photo = AsyncMock(side_effect=_next_message)
     bot.send_document = AsyncMock(side_effect=_next_message)
+    bot.delete_message = AsyncMock(return_value=True)
     bot.send_media_group = AsyncMock(side_effect=_send_media_group)
     bot.get_file = AsyncMock(side_effect=files or (lambda fid: _make_file()))
     return bot
@@ -215,7 +228,7 @@ class TestMockupsToProductsGroup:
 class TestPrintsToPrintGroup:
 
     async def test_single_print_keeps_single_document_behaviour(self):
-        design = _make_design(prints=['p1'])
+        design = _make_design(prints=['p1'], print_extension='png')
         bot = _make_bot()
 
         with patch('handlers.reviewer.DesignGroupMessage.record') as record:
@@ -231,7 +244,7 @@ class TestPrintsToPrintGroup:
         assert record.call_args.kwargs['group_type'] == 'print'
 
     async def test_multiple_prints_sent_as_album_with_renamed_files(self):
-        design = _make_design(prints=['p1', 'p2', 'p3'])
+        design = _make_design(prints=['p1', 'p2', 'p3'], print_extension='pdf')
         bot = _make_bot(files=lambda fid: _make_file(file_path=f'files/{fid}.pdf'))
 
         with patch('handlers.reviewer.DesignGroupMessage.record') as record:
@@ -257,7 +270,7 @@ class TestPrintsToPrintGroup:
 
     async def test_more_than_ten_prints_are_split_across_albums(self):
         prints = [f'p{i}' for i in range(MAX_MEDIA_GROUP_ITEMS + 1)]
-        design = _make_design(prints=prints)
+        design = _make_design(prints=prints, print_extension='psd')
         bot = _make_bot(files=lambda fid: _make_file(file_path='files/x.psd'))
 
         with patch('handlers.reviewer.DesignGroupMessage.record') as record:
@@ -282,8 +295,8 @@ class TestPrintsToPrintGroup:
             'p1': _make_file(file_path='files/p1.psd', file_size=large_size),
             'p2': _make_file(file_path='files/p2.psd', file_size=1024),
         }
-        design = _make_design(prints=['p1', 'p2'])
-        bot = _make_bot(files=lambda fid: files[fid])
+        design = _make_design(prints=['p1', 'p2'], print_extension='psd')
+        bot = _make_bot(files=lambda fid: files[fid], probe_name='original.psd', probe_size=large_size)
 
         with patch('handlers.reviewer.DesignGroupMessage.record'):
             await _send_prints_to_print_group(
@@ -298,13 +311,13 @@ class TestPrintsToPrintGroup:
         files['p2'].download_as_bytearray.assert_awaited_once()
         # Large files keep their original name — warned in the album caption
         assert 'فایل بزرگ' in media[0].caption
-        assert 'TS001_1.psd' in media[0].caption
+        assert 'TS001_1' in media[0].caption
 
     async def test_upload_size_cap_splits_prints_into_more_albums(self, monkeypatch):
         # Budget fits two 1 KB files per album
         monkeypatch.setattr('handlers.reviewer.MEDIA_GROUP_MAX_UPLOAD_BYTES', 2500)
         prints = [f'p{i}' for i in range(4)]
-        design = _make_design(prints=prints)
+        design = _make_design(prints=prints, print_extension='pdf')
         bot = _make_bot(files=lambda fid: _make_file(file_path='files/x.pdf', file_size=1024))
 
         with patch('handlers.reviewer.DesignGroupMessage.record'):
@@ -321,8 +334,8 @@ class TestPrintsToPrintGroup:
         assert all(ok for _, ok, _ in results)
 
     async def test_album_failure_falls_back_to_individual_sends(self):
-        design = _make_design(prints=['p1', 'p2'])
-        bot = _make_bot(media_group_error=RuntimeError('album rejected'))
+        design = _make_design(prints=['p1', 'p2'], print_extension='png')
+        bot = _make_bot(media_group_error=BadRequest('album rejected'))
 
         with patch('handlers.reviewer.DesignGroupMessage.record'):
             results = await _send_prints_to_print_group(
@@ -335,15 +348,15 @@ class TestPrintsToPrintGroup:
         assert captions == ['قاب موبایل - TS001 (1/2)', 'قاب موبایل - TS001 (2/2)']
         assert all(ok for _, ok, _ in results)
 
-    async def test_failed_prepare_is_reported_and_does_not_block_the_album(self):
-        design = _make_design(prints=['p1', 'p2'])
+    async def test_get_file_failure_uses_id_without_blocking_the_album(self):
+        design = _make_design(prints=['p1', 'p2'], print_extension='png')
 
         async def _get_file(fid):
             if fid == 'p1':
-                raise RuntimeError('file gone')
+                raise RuntimeError('file information unavailable')
             return _make_file(file_path='files/x.png')
 
-        bot = _make_bot()
+        bot = _make_bot(probe_name='original.png')
         bot.get_file = AsyncMock(side_effect=_get_file)
 
         with patch('handlers.reviewer.DesignGroupMessage.record'):
@@ -351,10 +364,12 @@ class TestPrintsToPrintGroup:
                 bot, design, ['p1', 'p2'], PRINT_CHAT_ID, 'TS001', 'قاب موبایل'
             )
 
-        bot.send_media_group.assert_not_awaited()  # only one file left
-        bot.send_document.assert_awaited_once()
-        assert results[0][0] == 'p1' and results[0][1] is False
-        assert results[1][0] == 'p2' and results[1][1] is True
+        media = _album_media(bot)
+        assert media[0].media == 'p1'
+        assert media[1].media.filename == 'TS001_2.png'
+        assert 'نام تلگرام' in media[0].caption
+        assert all(ok for _, ok, _ in results)
+        assert results[0][2].startswith('warning: ')
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +386,7 @@ class TestApproveCallbackUsesAlbums:
             mockups=['m1', 'm2'],
             prints=['p1', 'p2'],
             file_types={'m1': 'photo', 'm2': 'photo'},
+            print_extension='png',
         )
         design.approve = MagicMock(return_value=True)
         design.get_reviewer_messages = MagicMock(return_value=[])

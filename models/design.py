@@ -32,6 +32,7 @@ class Design:
         product_name: Optional[str] = None,
         product_icon: Optional[str] = None,
         file_types: Optional[dict] = None,
+        print_file_metadata: Optional[dict] = None,
         **kwargs
     ):
         self.id = id
@@ -53,6 +54,8 @@ class Design:
         self.product_icon = product_icon
         # Store file types: {file_id: 'photo'|'document'}
         self.file_types = file_types or {}
+        # getFile may lose the original document name and MIME type.
+        self.print_file_metadata = print_file_metadata or {}
 
         if kwargs:
             logging.warning(f"Design.__init__ received unknown kwargs: {list(kwargs.keys())}")
@@ -172,6 +175,15 @@ class Design:
             logging.error(f"Invalid JSON in file_types for design {row.get('code')}: {e}")
             row['file_types'] = {}
 
+        # Old designs have no filename metadata. Never guess a format here.
+        try:
+            raw = row.get('print_file_metadata')
+            metadata = json.loads(raw) if isinstance(raw, str) else raw
+            row['print_file_metadata'] = metadata if isinstance(metadata, dict) else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            logging.error(f"Invalid JSON in print_file_metadata for design {row.get('code')}: {e}")
+            row['print_file_metadata'] = {}
+
         return row
 
     @staticmethod
@@ -226,7 +238,7 @@ class Design:
         """
         Find a pending design whose reviewer mockup messages contain message_id.
 
-        Used when completing the two-step reject flow from a reply. The stored
+        Used for replies to legacy two-step reject prompts. The stored
         reviewer message list may also include the action-button message, so only
         the first N ids (N = mockup count) are considered valid reply targets.
         """
@@ -286,6 +298,9 @@ class Design:
                 logging.error(f"Failed to serialize file_types: {e}")
                 file_types_json = '{}'
 
+            # Fail the save rather than silently discard original filenames.
+            print_metadata_json = json.dumps(self.print_file_metadata, ensure_ascii=False)
+
             if self.id:
                 logging.info(
                     f"[DESIGN] save UPDATE branch | code={self.code} | id={self.id}"
@@ -296,6 +311,7 @@ class Design:
                         print_file_ids = %s,
                         mockup_message_ids_reviewer = %s,
                         file_types = %s,
+                        print_file_metadata = %s,
                         status = %s,
                         reviewer_user_id = %s,
                         reviewer_name = %s,
@@ -303,7 +319,7 @@ class Design:
                         final_name = %s
                     WHERE id = %s
                 """, (mockup_json, print_json, reviewer_msgs_json, file_types_json,
-                      self.status.value, self.reviewer_user_id, self.reviewer_name,
+                      print_metadata_json, self.status.value, self.reviewer_user_id, self.reviewer_name,
                       self.reviewed_at, self.final_name, self.id))
             else:
                 logging.info(
@@ -313,11 +329,11 @@ class Design:
                 cursor.execute("""
                     INSERT INTO designs
                     (code, product_line_id, status, editor_user_id, editor_name,
-                     mockup_file_ids, print_file_ids, file_types, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     mockup_file_ids, print_file_ids, file_types, print_file_metadata, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (self.code, self.product_line_id, self.status.value,
                       self.editor_user_id, self.editor_name,
-                      mockup_json, print_json, file_types_json, now_utc))
+                      mockup_json, print_json, file_types_json, print_metadata_json, now_utc))
                 self.id = cursor.lastrowid
                 logging.info(
                     f"[DESIGN] save INSERT DONE | code={self.code} | new_id={self.id}"

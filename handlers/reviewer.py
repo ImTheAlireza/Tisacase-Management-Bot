@@ -1,5 +1,7 @@
 import asyncio
 import html
+import re
+from urllib.parse import quote, unquote, urlsplit
 from telegram import (
     Update,
     InputFile,
@@ -7,6 +9,7 @@ from telegram import (
     InputMediaDocument,
 )
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest, RetryAfter
 from utils.decorators import require_role
 from models.design import Design
 from models.design_group_message import DesignGroupMessage
@@ -14,6 +17,7 @@ from models.user import User
 from models.product_line import ProductLine
 from utils.helpers import safe_edit_message, delete_messages, send_with_retry, safe_answer_callback
 from config.settings import (
+    BOT_TOKEN,
     SUDO_USER_ID,
     MAX_FILE_SIZE_DOWNLOAD_MB,
     MEDIA_GROUP_MAX_UPLOAD_BYTES,
@@ -28,6 +32,16 @@ LOG_TAG = "[REVIEW]"
 REJECT_REASON_PROMPT = "دلیل رد این طرح رو روی همین پیام ریپلای کنید."
 REJECT_REASON_STATE_KEY = "awaiting_reject_reasons"
 MAX_REJECTION_REASON_LENGTH = 3000
+
+
+def _safe_telegram_error(error: Exception) -> str:
+    """Never copy a bot token from a network exception into logs or messages."""
+    detail = str(error)
+    if BOT_TOKEN:
+        for token in (BOT_TOKEN, quote(BOT_TOKEN, safe='')):
+            detail = detail.replace(token, '[REDACTED]')
+    return detail[:100]
+
 
 __all__ = [
     "review_callback",
@@ -57,7 +71,7 @@ async def _send_log_to_group(context, text: str) -> None:
             f"{LOG_TAG} send log to LOG_GROUP_ID"
         )
     except Exception as e:
-        logging.error(f"{LOG_TAG} Failed to send log to LOG_GROUP_ID: {e}")
+        logging.error(f"{LOG_TAG} Failed to send log to LOG_GROUP_ID: {_safe_telegram_error(e)}")
 
 
 def _log_to_group(context, text: str) -> None:
@@ -90,37 +104,6 @@ def _truncate_rejection_reason(reason: str) -> str:
     return reason[:MAX_REJECTION_REASON_LENGTH] + "\n…"
 
 
-def _get_reviewer_mockup_message_ids(design: Design, reviewer_user_id: int) -> list[int]:
-    """
-    Return only the reviewer PV mockup message ids for this design.
-
-    mockup_message_ids_reviewer also stores the action-button message id for
-    multi-file submissions and pending-list views; the mockups are always saved
-    first, so slicing by mockup count excludes that button message.
-    """
-    msg_ids = design.get_reviewer_messages(reviewer_user_id)
-    mockup_msg_ids = []
-    for msg_id in msg_ids[:len(design.mockup_file_ids)]:
-        try:
-            mockup_msg_ids.append(int(msg_id))
-        except (TypeError, ValueError):
-            continue
-    return mockup_msg_ids
-
-
-def _remember_reject_reason_targets(
-    context: ContextTypes.DEFAULT_TYPE,
-    code: str,
-    message_ids: list[int]
-) -> None:
-    pending = context.user_data.get(REJECT_REASON_STATE_KEY)
-    if not isinstance(pending, dict):
-        pending = {}
-        context.user_data[REJECT_REASON_STATE_KEY] = pending
-    for msg_id in message_ids:
-        pending[str(msg_id)] = code
-
-
 def _clear_reject_reason_state(
     context: ContextTypes.DEFAULT_TYPE,
     code: str | None = None
@@ -140,104 +123,6 @@ def _clear_reject_reason_state(
 
     if not pending:
         context.user_data.pop(REJECT_REASON_STATE_KEY, None)
-
-
-async def _edit_reject_prompt_caption(bot, chat_id: int, message_id: int) -> bool:
-    try:
-        await bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=REJECT_REASON_PROMPT,
-            reply_markup=None
-        )
-        return True
-    except Exception as e:
-        logging.warning(
-            f"{LOG_TAG} Could not edit reject prompt caption "
-            f"chat={chat_id} msg={message_id}: {e}"
-        )
-        return False
-
-
-async def _request_reject_reason(
-    query,
-    context: ContextTypes.DEFAULT_TYPE,
-    design: Design,
-    user: User,
-    code: str
-) -> None:
-    """
-    First step of rejection: ask the reviewer to reply with the reason.
-
-    The design remains pending until a text reply arrives on the prompted mockup
-    message. This keeps the code/process unchanged until a reason is captured.
-    """
-    chat_id = query.message.chat_id
-    target_msg_id: int | None = None
-
-    # Prefer the media message that actually owns the pressed inline button.
-    if query.message and (query.message.photo or query.message.document or query.message.caption is not None):
-        target_msg_id = query.message.message_id
-    # For multi-mockup submissions, the button message replies to the last mockup.
-    elif query.message and query.message.reply_to_message:
-        replied = query.message.reply_to_message
-        if replied.photo or replied.document or replied.caption is not None:
-            target_msg_id = replied.message_id
-
-    # Pending-list views send a separate button message without reply_to. In that
-    # case use the last mockup message recorded for this reviewer.
-    mockup_msg_ids = _get_reviewer_mockup_message_ids(design, user.user_id)
-    if target_msg_id is None and mockup_msg_ids:
-        target_msg_id = mockup_msg_ids[-1]
-
-    prompted_msg_ids: list[int] = []
-    if target_msg_id is not None:
-        if await _edit_reject_prompt_caption(context.bot, chat_id, target_msg_id):
-            prompted_msg_ids.append(target_msg_id)
-
-    # If caption editing failed for the preferred target, try the recorded mockups.
-    if not prompted_msg_ids:
-        for msg_id in reversed(mockup_msg_ids):
-            if await _edit_reject_prompt_caption(context.bot, chat_id, msg_id):
-                prompted_msg_ids.append(msg_id)
-                break
-
-    # Remove the buttons from the clicked message and make the next step clear.
-    try:
-        if query.message.text:
-            await query.edit_message_text(
-                "❌ درخواست رد ثبت شد.\n\n"
-                "دلیل رد را روی موکاپی که کپشنش تغییر کرد ریپلای کنید.",
-                reply_markup=None
-            )
-        else:
-            await query.edit_message_reply_markup(reply_markup=None)
-    except Exception as e:
-        logging.warning(f"{LOG_TAG} Could not clear reject buttons for {code}: {e}")
-
-    # Absolute fallback: if no media caption could be changed, ask on the button
-    # message itself and accept a reply to that message.
-    if not prompted_msg_ids:
-        try:
-            if query.message.text:
-                await query.edit_message_text(REJECT_REASON_PROMPT, reply_markup=None)
-                prompted_msg_ids.append(query.message.message_id)
-            else:
-                prompt_msg = await query.message.reply_text(REJECT_REASON_PROMPT)
-                prompted_msg_ids.append(prompt_msg.message_id)
-        except Exception as e:
-            logging.error(f"{LOG_TAG} Could not request reject reason for {code}: {e}")
-            try:
-                await query.message.reply_text("❌ خطا در ثبت درخواست رد")
-            except Exception:
-                pass
-            return
-
-    _remember_reject_reason_targets(context, code, prompted_msg_ids)
-    logging.info(
-        f"{LOG_TAG} Reject reason requested | code={code} | "
-        f"reviewer={user.user_id} | targets={prompted_msg_ids}"
-    )
 
 
 async def _send_decision_notifications(
@@ -272,9 +157,12 @@ async def _send_decision_notifications(
 
     for uid in recipients:
         try:
-            await context.bot.send_message(chat_id=uid, text=notification_text)
-        except Exception:
-            logging.exception(f"{LOG_TAG} Notification FAILED for {uid}")
+            await send_with_retry(
+                lambda uid=uid: context.bot.send_message(chat_id=uid, text=notification_text),
+                f"{LOG_TAG} decision notification to {uid}"
+            )
+        except Exception as e:
+            logging.error(f"{LOG_TAG} Notification FAILED for {uid}: {_safe_telegram_error(e)}")
 
 
 async def _cleanup_after_decision(
@@ -299,7 +187,8 @@ async def _finalize_rejection_with_reason(
     context: ContextTypes.DEFAULT_TYPE,
     code: str,
     reason: str,
-    user: User
+    user: User,
+    expected_design_id: int
 ) -> None:
     lock_key = f"review_{code}"
     acquired = await callback_lock.acquire(lock_key)
@@ -309,7 +198,7 @@ async def _finalize_rejection_with_reason(
 
     try:
         design = Design.get_by_code(code)
-        if not design:
+        if not design or design.id != expected_design_id:
             _clear_reject_reason_state(context, code)
             await update.message.reply_text("⚠️ این طرح قبلاً پردازش یا حذف شده است.")
             return
@@ -364,69 +253,55 @@ async def handle_reject_reason_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """
-    Complete a rejection when a reviewer replies to the prompted mockup caption.
+    """Accept replies to reason prompts sent by versions before one-tap reject.
 
-    Returns True when this message was consumed by the reject-reason flow.
+    New rejections never ask for a reason. Unrelated messages must not be
+    intercepted, and a stale prompt must not reject a new design that reused
+    the old code.
     """
     message = update.message
-    if not message or not message.text:
+    if not message or not message.text or message.chat.type != "private":
         return False
-
-    if message.chat.type != "private":
+    reply_msg = message.reply_to_message
+    if not reply_msg:
         return False
 
     pending = context.user_data.get(REJECT_REASON_STATE_KEY)
-    has_pending_state = isinstance(pending, dict) and bool(pending)
-
-    if not message.reply_to_message:
-        if has_pending_state:
-            await message.reply_text(
-                "برای ثبت دلیل رد، لطفاً روی پیام موکاپی که کپشنش تغییر کرده ریپلای کنید."
-            )
-            return True
-        return False
-
-    reply_msg = message.reply_to_message
-    reply_msg_id = reply_msg.message_id
-    code = pending.get(str(reply_msg_id)) if isinstance(pending, dict) else None
-
+    code = pending.get(str(reply_msg.message_id)) if isinstance(pending, dict) else None
     prompt_matches = (
-        (reply_msg.caption == REJECT_REASON_PROMPT)
-        or (reply_msg.text == REJECT_REASON_PROMPT)
+        reply_msg.caption == REJECT_REASON_PROMPT or reply_msg.text == REJECT_REASON_PROMPT
     )
-
-    if code is None and prompt_matches:
-        design = Design.get_pending_by_reviewer_message(
-            update.effective_user.id,
-            reply_msg_id
-        )
-        code = design.code if design else None
-
-    if code is None:
-        if has_pending_state:
-            await message.reply_text(
-                "این پیام، پیامِ درخواست دلیل رد نیست. لطفاً روی همان موکاپ ریپلای کنید."
-            )
-            return True
+    if not code and not prompt_matches:
         return False
 
     user = User.get_by_id(update.effective_user.id)
     if not user or not user.is_active:
         await message.reply_text("🚫 شما مجاز به استفاده از این ربات نیستید.")
         return True
-
-    effective_role = user.get_effective_role()
-    if not user.is_sudo and effective_role not in ('reviewer', 'sudo'):
-        await message.reply_text("🚫 فقط ناظر می‌تواند دلیل رد را ثبت کند.")
+    if not user.is_sudo and user.get_effective_role() not in ('reviewer', 'sudo'):
+        await message.reply_text("🚫 فقط ناظر می‌تواند طرح را رد کند.")
         return True
+
+    if code:
+        design = Design.get_by_code(code)
+        valid_ids = design.get_reviewer_messages(user.user_id) if design else []
+        if not design or design.status != DesignStatus.PENDING or str(reply_msg.message_id) not in {
+            str(mid) for mid in valid_ids
+        }:
+            _clear_reject_reason_state(context, code)
+            await message.reply_text("⚠️ این درخواست قدیمی است؛ طرح را از فهرست در انتظار باز کنید.")
+            return True
+    else:
+        design = Design.get_pending_by_reviewer_message(user.user_id, reply_msg.message_id)
+        if not design:
+            await message.reply_text("⚠️ این درخواست قدیمی است؛ طرح را از فهرست در انتظار باز کنید.")
+            return True
+        code = design.code
 
     reason = message.text.strip()
     if not reason:
-        await message.reply_text("❌ دلیل رد نمی‌تواند خالی باشد.")
-        return True
-
-    await _finalize_rejection_with_reason(update, context, code, reason, user)
+        return False
+    await _finalize_rejection_with_reason(update, context, code, reason, user, design.id)
     return True
 
 
@@ -441,7 +316,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # approve/reject work that follows.
     await safe_answer_callback(query)
 
-    user = User.get_by_id(query.from_user.id)
+    # require_role has already loaded and authorized this user.
+    user = context.user_data['db_user']
     action, code = query.data.split('_', 1)
 
     logging.info(f"{LOG_TAG} START | action={action} | code={code} | user={user.first_name}({user.user_id})")
@@ -477,11 +353,33 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # ── REJECT STEP 1 ──────────────────────────────────────────
-    # Do not mark the design as rejected yet. First ask for the reason, then
-    # handle_reject_reason_reply() will finalize the rejection on the reply.
+    # Reject immediately; the DB's conditional update arbitrates reviewer races.
     if action == "reject":
-        await _request_reject_reason(query, context, design, user, code)
+        product_line = ProductLine.get_by_id(design.product_line_id)
+        if not design.reject(user.user_id, user.first_name):
+            _clear_reject_reason_state(context, code)
+            await safe_edit_message(query, "⚠️ این طرح قبلاً توسط ناظر دیگری پردازش شده است.")
+            return
+
+        _clear_reject_reason_state(context, code)
+        _log_to_group(
+            context,
+            f"❌ <b>REJECT {html.escape(code)}</b> by "
+            f"{html.escape(user.first_name or str(user.user_id))}"
+        )
+        await safe_edit_message(query, f"❌ رد شد: {code}")
+        await _send_decision_notifications(
+            context=context, action="reject", code=code, design=design,
+            reviewer=user, product_line=product_line
+        )
+        await _cleanup_after_decision(context, design, user.user_id, code)
+        # The clicked message may have been deleted by cleanup; leave the
+        # reviewer a separate, persistent confirmation.
+        try:
+            await context.bot.send_message(chat_id=user.user_id, text=f"❌ رد شد: {code}")
+        except Exception as e:
+            logging.error(f"{LOG_TAG} Reviewer confirmation FAILED for {user.user_id}: {_safe_telegram_error(e)}")
+        logging.info(f"{LOG_TAG} END | {code} | reject")
         return
 
     if action != "approve":
@@ -537,6 +435,23 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         total_ok = mockup_ok + print_ok
         total_fail = mockup_fail + print_fail
         total_expected = total_mockups + total_prints
+        print_warnings = [detail for _, ok, detail in print_results
+                          if ok and detail.startswith(PRINT_WARNING_PREFIX)]
+        warning_text = (
+            f"⚠️ {len(print_warnings)} فایل چاپی با هشدار ارسال شد؛ "
+            "نام، پسوند و نسخه اصلی را بررسی کنید."
+        ) if print_warnings else ""
+        if total_fail:
+            delivery_alert = f"❌ ارسال {total_fail} فایل ناموفق یا نامشخص بود؛ لطفاً به Sudo اطلاع دهید."
+            if print_fail:
+                failed_prints = [detail for _, ok, detail in print_results if not ok]
+                delivery_alert += "\n" + "\n".join(f"• {detail[:160]}" for detail in failed_prints[:5])
+                delivery_alert += (f"\n🔧 بازیابی چاپی توسط Sudo: /resendprint {code}"
+                                   "\nپیش از ارسال مجدد، گروه چاپ را برای جلوگیری از چاپ تکراری بررسی کنید.")
+        elif not is_configured:
+            delivery_alert = "❌ خط تولید تنظیم نشده و فایل‌ها ارسال نشدند؛ لطفاً به Sudo اطلاع دهید."
+        else:
+            delivery_alert = ""
 
         if total_fail > 0:
             status_msg = f"✅ تایید شد: {code}\n\n📊 نتیجه ارسال:"
@@ -551,6 +466,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     failed.append(f"• چاپی: {detail[:80]}")
             if failed:
                 status_msg += f"\n\n❌ خطاها:\n" + "\n".join(failed[:5])
+            if warning_text:
+                status_msg += f"\n\n{warning_text}"
             status_msg += "\n\n⚠️ لطفاً به Sudo اطلاع دهید."
             await safe_edit_message(query, status_msg)
         elif not is_configured:
@@ -559,7 +476,10 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"✅ تایید شد: {code}\n\n⚠️ خط تولید تنظیم نشده — فایل‌ها ارسال نشدند.\nلطفاً به Sudo اطلاع دهید."
             )
         else:
-            await safe_edit_message(query, f"✅ تایید شد: {code}\n\n📊 {total_ok}/{total_expected} فایل ارسال شد.")
+            status_msg = f"✅ تایید شد: {code}\n\n📊 {total_ok}/{total_expected} فایل ارسال شد."
+            if warning_text:
+                status_msg += f"\n\n{warning_text}"
+            await safe_edit_message(query, status_msg)
 
         # ── Compact log to group: ONE message with everything ─
         log_lines = [f"✅ <b>APPROVE {code}</b> by {user.first_name}"]
@@ -581,6 +501,9 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             log_lines.append(f"🖨 Prints: 0 files")
 
+        if print_warnings:
+            log_lines.append(f"⚠️ Prints with unchanged/unverified names: {len(print_warnings)}")
+
         # Log failures with details
         failures = [(fid, d) for fid, ok, d in mockup_results + print_results if not ok]
         if failures:
@@ -601,6 +524,14 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     await _cleanup_after_decision(context, design, user.user_id, code)
+    alerts = [text for text in (delivery_alert, warning_text) if text]
+    if alerts:
+        # Cleanup may delete the edited button message, so persist the alerts.
+        for alert_user_id in {user.user_id, SUDO_USER_ID}:
+            try:
+                await context.bot.send_message(chat_id=alert_user_id, text=f"{code}\n" + "\n".join(alerts))
+            except Exception as e:
+                logging.error(f"{LOG_TAG} Delivery alert FAILED for {alert_user_id}: {_safe_telegram_error(e)}")
 
     logging.info(f"{LOG_TAG} END | {code} | {action}")
 
@@ -656,10 +587,9 @@ async def _resolve_mockup_kind(bot, fid: str, file_types: dict) -> str:
     try:
         file = await bot.get_file(fid)
     except Exception as e:
-        logging.warning(f"{LOG_TAG} mockup type lookup failed for {str(fid)[:30]}: {e}")
+        logging.warning(f"{LOG_TAG} mockup type lookup failed for {str(fid)[:30]} ({type(e).__name__})")
         return 'unknown'
-    path = file.file_path or ''
-    ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
+    ext = _telegram_path_extension(file.file_path)
     if ext in MOCKUP_PHOTO_EXTENSIONS:
         return 'photo'
     return 'document' if ext else 'unknown'
@@ -728,7 +658,7 @@ async def _send_mockups_to_products_group(bot, design: Design, product_line, cod
                     lambda: bot.send_media_group(chat_id, media=media), label
                 )
             except Exception as e:
-                logging.error(f"{LOG_TAG} {label} ALBUM FAILED: {code} | {e}")
+                logging.error(f"{LOG_TAG} {label} ALBUM FAILED: {code} | {_safe_telegram_error(e)}")
                 msgs = None
 
             if msgs:
@@ -751,41 +681,273 @@ async def _send_mockups_to_products_group(bot, design: Design, product_line, cod
                 results.append((fid, True, f"msg={msg.message_id}"))
                 logging.info(f"{LOG_TAG} {file_label} OK → {chat_id}")
             except Exception as e:
-                logging.exception(f"{LOG_TAG} {file_label} FAILED: {code} | fid={str(fid)[:30]}")
-                results.append((fid, False, str(e)[:100]))
+                detail = _safe_telegram_error(e)
+                logging.error(f"{LOG_TAG} {file_label} FAILED: {code} | fid={str(fid)[:30]} | {detail}")
+                results.append((fid, False, detail))
 
     return results
 
 
-async def _describe_print_file(bot, fid: str, code: str, index: int, total: int,
-                               max_size_bytes: int) -> dict:
-    """Resolve the renamed filename, size and file handle for one print file.
+PRINT_WARNING_PREFIX = 'warning: '
 
-    Files above the download limit keep their original name and are sent by
-    file_id; smaller ones are re-uploaded as ``{code}_{n}.{ext}``. The payload
-    itself is downloaded later, per album, to keep memory usage bounded.
+
+def _filename_extension(name: str | None) -> str | None:
+    """Extract only a safe suffix from a basename, never a directory or URL."""
+    if not isinstance(name, str):
+        return None
+    basename = name.replace('\\', '/').rsplit('/', 1)[-1]
+    stem, separator, suffix = basename.rpartition('.')
+    if not separator or not stem or not re.fullmatch(r'[A-Za-z0-9]{1,16}', suffix):
+        return None
+    return suffix.lower()
+
+
+def _telegram_path_extension(path: str | None) -> str | None:
+    """Look at the path's last component only (the URL host contains dots).
+
+    In PTB this path can be a complete URL containing the bot token. It must
+    never be used as a filename or included in a caption/log.
     """
-    file = await bot.get_file(fid)
-    path = file.file_path or ''
-    ext = path.rsplit('.', 1)[-1].lower() if '.' in path else 'png'
-    filename = f"{code}.{ext}" if total == 1 else f"{code}_{index + 1}.{ext}"
-    large = bool(file.file_size and file.file_size > max_size_bytes)
-    return {
-        'file_id': fid,
-        'filename': filename,
-        'large': large,
-        'size': 0 if large else int(file.file_size or 0),
-        'index': index,
-        'file': file,
-        'data': None,
+    if not isinstance(path, str):
+        return None
+    try:
+        return _filename_extension(unquote(urlsplit(path).path))
+    except ValueError:
+        return None
+
+
+def _sniff_print_extension(data: bytes | bytearray) -> str | None:
+    """Recover a few unambiguous formats for legacy files without a name.
+
+    In particular, don't guess PDF: PDF-compatible Illustrator (.ai) files can
+    have the same header. Unknown formats need an original document name.
+    """
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if len(data) >= 6 and data[:4] == b'8BPS':
+        if data[4:6] == b'\x00\x01':
+            return 'psd'
+        if data[4:6] == b'\x00\x02':
+            return 'psb'
+    if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    # TIFF magic is also used by several camera RAW formats; recover the
+    # document's actual name instead of guessing .tif from the shared header.
+    if data.startswith((b'GIF87a', b'GIF89a')):
+        return 'gif'
+    if len(data) >= 26 and data.startswith(b'BM'):
+        # The two letters alone are too weak; require a plausible BMP header.
+        size = int.from_bytes(data[2:6], 'little')
+        pixels = int.from_bytes(data[10:14], 'little')
+        dib = int.from_bytes(data[14:18], 'little')
+        if (size == len(data) and dib in {12, 40, 52, 56, 64, 108, 124}
+                and 14 + dib <= pixels <= len(data)):
+            return 'bmp'
+    return None
+
+
+def _compatible_print_extension(expected: str, detected: str) -> bool:
+    """Accept equivalent suffixes while rejecting a known format mismatch."""
+    aliases = {
+        'jpg': {'jpg', 'jpeg', 'jpe', 'jfif'},
+        'png': {'png', 'apng'},
     }
+    return expected in aliases.get(detected, {detected})
+
+
+def _use_print_file_id(item: dict, warning: str) -> None:
+    item['send_by_id'] = True
+    item['warning'] = warning
+    item['data'] = None
+    item['size'] = 0
+
+
+async def _describe_print_file(bot, fid: str, code: str, index: int, total: int,
+                               max_size_bytes: int, metadata: dict | None = None,
+                               extension_override: str | None = None) -> dict:
+    """Resolve a safe filename and size before loading the print payload."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    # MIME types can be generic or wrong. If no original suffix was saved,
+    # verify recognizable bytes instead of inventing a name from MIME alone.
+    saved_ext = _filename_extension(metadata.get('file_name'))
+    if extension_override is not None:
+        # Overrides are an explicit, confirmed Sudo action, never a guess.
+        ext = _filename_extension(f"x.{extension_override}")
+        if ext is None:
+            raise ValueError('invalid print extension override')
+    else:
+        ext = saved_ext
+
+    # The code is normally alphanumeric, but do not allow path components even
+    # if a corrupted/legacy database contains an unexpected value.
+    safe_code = ''.join(ch if ch.isalnum() or ch in '_-' else '_' for ch in code)
+    base = safe_code if total == 1 else f"{safe_code}_{index + 1}"
+    item = {
+        'file_id': fid,
+        'base': base,
+        'filename': f"{base}.{ext}" if ext else None,
+        'size': 0,
+        'index': index,
+        'file': None,
+        'data': None,
+        'send_by_id': False,
+        'warning': ('پسوند را مدیر به‌صورت دستی تعیین کرده است؛ فرمت را بررسی کنید'
+                    if extension_override is not None else None),
+        'expected_extension': ext,
+        'error': None,
+    }
+    try:
+        file = await bot.get_file(fid)
+    except Exception as e:
+        # getFile can fail for files above Telegram's download limit even when
+        # the original file_id remains perfectly usable for sending.
+        logging.warning(f"{LOG_TAG} Print {index + 1}/{total} getFile failed ({type(e).__name__}); checking original ID")
+        _use_print_file_id(item, 'دریافت اطلاعات ناموفق بود؛ با نام تلگرام ارسال شد')
+        return item
+
+    item['file'] = file
+    # getFile's generated path is not the original name and its suffix may be
+    # based on a generic MIME type (e.g. a PDF-compatible Illustrator file).
+    # For legacy records with no saved name, inspect bytes or recover the
+    # original document name from Telegram before sending.
+    size = file.file_size
+    if isinstance(size, int) and size <= 0:
+        # A known zero-length or invalid-size source is not a usable print.
+        item['error'] = f"فایل {index + 1}: فایل خالی است یا حجم نامعتبر دارد؛ نسخه اصلی لازم است."
+    elif not isinstance(size, int):
+        _use_print_file_id(item, 'حجم فایل نامشخص بود؛ با نام تلگرام ارسال شد')
+    elif size > max_size_bytes:
+        _use_print_file_id(item, 'فایل بزرگ است؛ با نام تلگرام ارسال شد')
+    else:
+        item['size'] = size
+    return item
 
 
 async def _load_print_payload(item: dict) -> None:
-    """Download the bytes needed to re-upload one print file (idempotent)."""
-    if item['large'] or item['data'] is not None:
+    """Download once, verify length, and safely handle missing/unknown data."""
+    if item['send_by_id'] or item['data'] is not None:
         return
-    item['data'] = await item['file'].download_as_bytearray()
+    try:
+        data = await item['file'].download_as_bytearray()
+        if len(data) != item['size']:
+            raise ValueError(f"incomplete download ({len(data)} of {item['size']} bytes)")
+        item['data'] = data
+        detected = _sniff_print_extension(data)
+        expected = item['expected_extension']
+        if expected and detected and not _compatible_print_extension(expected, detected):
+            item['data'] = None
+            item['error'] = (
+                f"فایل {item['index'] + 1}: پسوند با فرمت شناسایی‌شده هماهنگ نیست؛ "
+                "نسخه اصلی یا پسوند صحیح را بررسی کنید."
+            )
+            return
+        if item['filename'] is None and detected:
+            item['filename'] = f"{item['base']}.{detected}"
+        # Otherwise retain the bytes: the original name may still be
+        # recoverable from a Telegram document message (unlike getFile).
+    except Exception as e:
+        # Do not put the download URL (and bot token) into logs or captions.
+        logging.warning(f"{LOG_TAG} Print {item['index'] + 1} download failed ({type(e).__name__}); checking original ID")
+        _use_print_file_id(item, 'دانلود کامل نشد؛ با نام تلگرام ارسال شد')
+
+
+async def _recover_original_print_extension(bot, item: dict) -> str | None:
+    """Read Telegram's original document name using a temporary private copy.
+
+    getFile has no original filename; a sent Message.document can have one.
+    Only the configured Sudo's *private* chat may receive the temporary copy.
+    It is silent and deleted immediately on a best-effort basis. An absent name,
+    mismatched identity/size, or a failed probe is never treated as an answer.
+    Telegram may no longer retain the source document, so this is not guaranteed.
+    """
+    if not isinstance(SUDO_USER_ID, int) or SUDO_USER_ID <= 0:
+        logging.warning(f"{LOG_TAG} Cannot recover print name: invalid Sudo private chat")
+        return None
+
+    message = None
+    try:
+        message = await send_with_retry(
+            lambda: bot.send_document(
+                chat_id=SUDO_USER_ID,
+                document=item['file_id'],
+                caption=(f"🔎 بررسی خودکار نام فایل {item['base']}؛ "
+                         "این پیام پس از بررسی حذف می‌شود."),
+                disable_notification=True,
+                disable_content_type_detection=True,
+            ),
+            f"{LOG_TAG} recover print filename"
+        )
+        document = getattr(message, 'document', None)
+        name = getattr(document, 'file_name', None)
+        extension = _filename_extension(name)
+        # Generic container names are not evidence of the original print
+        # format. A Sudo can still explicitly choose one for a downloaded file.
+        if not extension or extension in {'bin', 'dat', 'tmp', 'unknown'}:
+            return None
+
+        original = item.get('file')
+        expected_id = getattr(original, 'file_unique_id', None)
+        actual_id = getattr(document, 'file_unique_id', None)
+        if (isinstance(expected_id, str) and isinstance(actual_id, str)
+                and expected_id and actual_id and expected_id != actual_id):
+            logging.warning(f"{LOG_TAG} Refusing recovered print name: file identity differs")
+            return None
+        expected_size = getattr(original, 'file_size', None)
+        actual_size = getattr(document, 'file_size', None)
+        if (isinstance(expected_size, int) and expected_size > 0
+                and isinstance(actual_size, int) and actual_size > 0
+                and expected_size != actual_size):
+            logging.warning(f"{LOG_TAG} Refusing recovered print name: file size differs")
+            return None
+        return extension
+    except Exception as e:
+        # Network exceptions may contain a getFile URL with the bot token.
+        logging.warning(f"{LOG_TAG} Print filename recovery failed: {_safe_telegram_error(e)}")
+        return None
+    finally:
+        message_id = getattr(message, 'message_id', None)
+        if isinstance(message_id, int):
+            try:
+                await send_with_retry(
+                    lambda: bot.delete_message(chat_id=SUDO_USER_ID, message_id=message_id),
+                    f"{LOG_TAG} delete temporary print copy"
+                )
+            except Exception as e:
+                # The private Sudo copy can remain if Telegram refuses deletion.
+                logging.warning(f"{LOG_TAG} Temporary print copy was not deleted: {_safe_telegram_error(e)}")
+
+
+async def _prepare_print_for_delivery(bot, item: dict) -> None:
+    """Refuse unknown original formats rather than silently sending file_630."""
+    if item['error']:
+        return
+    await _load_print_payload(item)
+    if item['error']:
+        return
+    if item['filename'] is not None and not item['send_by_id']:
+        return
+
+    recovered = await _recover_original_print_extension(bot, item)
+    expected = item['expected_extension']
+    if not recovered:
+        item['error'] = (
+            f"فایل {item['index'] + 1}: پسوند اصلی بازیابی نشد؛ "
+            "فایل اصلی را دوباره ارسال کنید یا Sudo پسوند صحیح را مشخص کند."
+        )
+    elif item['send_by_id'] and expected and recovered != expected:
+        # Sending by file_id cannot rename the document. A mismatch means even
+        # a saved or manually supplied extension cannot be enforced safely.
+        item['error'] = (
+            f"فایل {item['index'] + 1}: پسوند اصلی با نام ثبت‌شده متفاوت است؛ "
+            "نسخه اصلی را دوباره ارسال کنید."
+        )
+    elif item['filename'] is None:
+        item['filename'] = f"{item['base']}.{recovered}"
+
+    if item['error']:
+        item['data'] = None
 
 
 def _group_print_items(items: list, max_count: int, max_bytes: int) -> list:
@@ -818,26 +980,37 @@ def _group_print_items(items: list, max_count: int, max_bytes: int) -> list:
 
 def _print_media(item: dict, caption: str):
     """Album item for one print file (InputFile is rebuilt on every attempt)."""
-    if item['large']:
+    if item['send_by_id']:
         return InputMediaDocument(media=item['file_id'], caption=caption)
     return InputMediaDocument(
-        media=InputFile(BytesIO(item['data']), filename=item['filename']),
+        # Album uploads must have a unique attach:// reference; without this
+        # Telegram gets missing media fields and only one multipart payload.
+        media=InputFile(BytesIO(item['data']), filename=item['filename'], attach=True),
         caption=caption
     )
 
 
-def _large_file_note(item: dict) -> str:
-    return f"⚠️ {item['filename']} (فایل بزرگ — نام تغییر نکرد)"
+def _print_file_note(item: dict) -> str:
+    # A file_id send keeps Telegram's original name, not the code-based name.
+    label = item['base'] if item['send_by_id'] else (item['filename'] or item['base'])
+    return f"⚠️ {label}: {item['warning']}"
+
+
+def _print_result_detail(item: dict, message_id: int) -> str:
+    if item['warning']:
+        return f"{PRINT_WARNING_PREFIX}{_print_file_note(item)} (msg={message_id})"
+    return f"fn={item['filename']} msg={message_id}"
 
 
 async def _send_one_print(bot, chat_id: int, item: dict, caption: str, label: str):
-    """Send a single print document (single files, lone tail, fallbacks)."""
-    await _load_print_payload(item)
-    if item['large']:
+    """Send an already prepared print document (also used for album fallbacks)."""
+    caption_with_warning = (
+        f"{caption}\n{_print_file_note(item)}" if item['warning'] else caption
+    )
+    if item['send_by_id']:
         return await send_with_retry(
             lambda: bot.send_document(
-                chat_id, document=item['file_id'],
-                caption=f"{caption}\n{_large_file_note(item)}"
+                chat_id, document=item['file_id'], caption=caption_with_warning
             ),
             label
         )
@@ -845,20 +1018,22 @@ async def _send_one_print(bot, chat_id: int, item: dict, caption: str, label: st
         lambda: bot.send_document(
             chat_id,
             document=InputFile(BytesIO(item['data']), filename=item['filename']),
-            caption=caption
+            caption=caption_with_warning
         ),
         label
     )
 
 
 async def _send_prints_to_print_group(bot, design: Design, prints: list, chat_id: int,
-                                      code: str, product_name: str) -> list:
+                                      code: str, product_name: str,
+                                      selected_indices: set[int] | None = None,
+                                      extension_overrides: dict | None = None) -> list:
     """Deliver approved print files to the print group.
 
     A single file keeps the old single-document behaviour. Two or more are
     uploaded as albums of renamed documents (``{code}_{n}.{ext}``), split by
-    both item count and upload size. Albums that fail fall back to per-file
-    sends so one bad item cannot lose the rest.
+    both item count and upload size. Albums explicitly rejected by Telegram
+    fall back to individual sends; ambiguous network errors are not retried.
 
     Returns the ``(file_id, ok, detail)`` results used by the approve summary.
     """
@@ -870,65 +1045,92 @@ async def _send_prints_to_print_group(bot, design: Design, prints: list, chat_id
     caption_base = f"{product_name} - {code}"
     max_size_bytes = MAX_FILE_SIZE_DOWNLOAD_MB * 1024 * 1024
 
-    # Pass 1: resolve names/sizes so albums can be planned before any payload
-    # is downloaded; failed lookups are reported without blocking the rest.
+    # Plan by size first; unresolved original names are checked privately
+    # before anything is sent to the printing group.
     items: list = []
+    metadata = design.print_file_metadata if isinstance(design.print_file_metadata, dict) else {}
+    overrides = extension_overrides if isinstance(extension_overrides, dict) else {}
     for index, fid in enumerate(prints):
+        if selected_indices is not None and index not in selected_indices:
+            continue
         try:
             items.append(await _describe_print_file(
-                bot, fid, code, index, total, max_size_bytes
+                bot, fid, code, index, total, max_size_bytes, metadata.get(fid),
+                overrides.get(fid)
             ))
         except Exception as e:
-            logging.exception(
-                f"{LOG_TAG} Print {index + 1}/{total} LOOKUP FAILED: {code} | fid={str(fid)[:30]}"
+            detail = _safe_telegram_error(e)
+            logging.error(
+                f"{LOG_TAG} Print {index + 1}/{total} LOOKUP FAILED: {code} | "
+                f"fid={str(fid)[:30]} | {detail}"
             )
-            results.append((fid, False, str(e)[:100]))
+            results.append((fid, False, f'فایل {index + 1}: {detail}'))
 
     if not items:
         return results
 
     for group in _group_print_items(items, MAX_MEDIA_GROUP_ITEMS, MEDIA_GROUP_MAX_UPLOAD_BYTES):
+        # Payloads live only as long as their album (bounded by the size cap).
+        # A failed format lookup must not prevent the other files from going out.
+        for item in group:
+            await _prepare_print_for_delivery(bot, item)
+            if item['error']:
+                results.append((item['file_id'], False, item['error']))
+        group = [item for item in group if not item['error']]
+        if not group:
+            continue
         first, last = group[0]['index'] + 1, group[-1]['index'] + 1
         label = f"Prints {first}-{last}/{total} → print group"
         caption = caption_base if total == 1 else f"{caption_base} ({first}-{last}/{total})"
-        large_notes = [_large_file_note(item) for item in group if item['large']]
-        first_caption = caption + ("\n" + "\n".join(large_notes) if large_notes else "")
+
+        notes = [_print_file_note(item) for item in group if item['warning']]
+        if len(notes) > 5:
+            # Telegram captions are limited to 1024 characters. Individual
+            # fallback sends still carry their own warning if the album fails.
+            notes = notes[:5] + [f"⚠️ {len(notes) - 5} فایل دیگر نیز با هشدار ارسال شد."]
+        first_caption = caption + ("\n" + "\n".join(notes) if notes else "")
 
         if len(group) > 1:
-            # Payloads live only as long as their album (bounded by the size cap).
-            downloaded = True
-            for item in group:
-                try:
-                    await _load_print_payload(item)
-                except Exception as e:
-                    downloaded = False
-                    logging.exception(
-                        f"{LOG_TAG} Print {item['index'] + 1}/{total} DOWNLOAD FAILED: {code} | {e}"
-                    )
+            def _build_media(group=group, first_caption=first_caption):
+                return [
+                    _print_media(item, first_caption if position == 0 else "")
+                    for position, item in enumerate(group)
+                ]
 
-            if downloaded:
-                def _build_media(group=group, first_caption=first_caption):
-                    return [
-                        _print_media(item, first_caption if position == 0 else "")
-                        for position, item in enumerate(group)
-                    ]
+            try:
+                msgs = await send_with_retry(
+                    lambda: bot.send_media_group(chat_id, media=_build_media()), label
+                )
+            except (BadRequest, RetryAfter) as e:
+                # Telegram explicitly rejected the request, so no album was
+                # accepted and individual retries cannot duplicate a print job.
+                logging.error(f"{LOG_TAG} {label} ALBUM REJECTED: {code} | {_safe_telegram_error(e)}")
+                msgs = None
+            except Exception as e:
+                # A timeout/network failure can happen *after* Telegram accepted
+                # the album. Retrying automatically could print the same job twice.
+                logging.error(f"{LOG_TAG} {label} ALBUM UNKNOWN: {code} | {_safe_telegram_error(e)}")
+                for item in group:
+                    results.append((item['file_id'], False,
+                                    f"فایل {item['index'] + 1}: نتیجه ارسال آلبوم نامشخص است؛ پیش از تلاش مجدد گروه چاپ را بررسی کنید."))
+                    item['data'] = None
+                continue
 
-                try:
-                    msgs = await send_with_retry(
-                        lambda: bot.send_media_group(chat_id, media=_build_media()), label
-                    )
-                except Exception as e:
-                    logging.error(f"{LOG_TAG} {label} ALBUM FAILED: {code} | {e}")
-                    msgs = None
-
-                if msgs:
-                    for item, msg in zip(group, msgs):
-                        _record_group_file(design, code, 'print', chat_id,
-                                           msg.message_id, item['file_id'], item['index'])
-                        results.append((item['file_id'], True,
-                                        f"fn={item['filename']} msg={msg.message_id}"))
-                        logging.info(f"{LOG_TAG} Print {item['index'] + 1}/{total} OK → {chat_id}")
-                    continue
+            if msgs is not None:
+                for item, msg in zip(group, msgs):
+                    _record_group_file(design, code, 'print', chat_id,
+                                       msg.message_id, item['file_id'], item['index'])
+                    results.append((item['file_id'], True,
+                                    _print_result_detail(item, msg.message_id)))
+                    logging.info(f"{LOG_TAG} Print {item['index'] + 1}/{total} OK → {chat_id}")
+                # An incomplete success response is also ambiguous: do not
+                # resend the missing entries automatically.
+                for item in group[len(msgs):]:
+                    results.append((item['file_id'], False,
+                                    f"فایل {item['index'] + 1}: پاسخ آلبوم ناقص است؛ پیش از تلاش مجدد گروه چاپ را بررسی کنید."))
+                for item in group:
+                    item['data'] = None
+                continue
 
         for item in group:
             index = item['index']
@@ -941,13 +1143,18 @@ async def _send_prints_to_print_group(bot, design: Design, prints: list, chat_id
                 _record_group_file(design, code, 'print', chat_id,
                                    msg.message_id, item['file_id'], index)
                 results.append((item['file_id'], True,
-                                f"fn={item['filename']} msg={msg.message_id}"))
+                                _print_result_detail(item, msg.message_id)))
                 logging.info(f"{LOG_TAG} {item_label} OK → {chat_id}")
             except Exception as e:
-                logging.exception(
-                    f"{LOG_TAG} {item_label} FAILED: {code} | fid={str(item['file_id'])[:30]}"
+                detail = _safe_telegram_error(e)
+                logging.error(
+                    f"{LOG_TAG} {item_label} FAILED: {code} | "
+                    f"fid={str(item['file_id'])[:30]} | {detail}"
                 )
-                results.append((item['file_id'], False, str(e)[:100]))
+                results.append((item['file_id'], False, f'فایل {index + 1}: {detail}'))
+
+        for item in group:
+            item['data'] = None
 
     return results
 
